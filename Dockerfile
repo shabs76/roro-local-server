@@ -20,10 +20,8 @@ RUN go mod download
 # Build the Go application for Linux (using Alpine)
 RUN GOOS=linux GOARCH=arm64 go build -o main .
 # start alpine for ffmpeg
-FROM alpine
-RUN apk update
-RUN apk upgrade
-RUN apk add --no-cache ffmpeg libwebp tzdata
+FROM alpine:latest
+RUN apk add --no-cache ffmpeg libwebp tzdata ca-certificates
 COPY --from=0 /app/main /usr/bin/main
 
 # Expose the port your application will run on
