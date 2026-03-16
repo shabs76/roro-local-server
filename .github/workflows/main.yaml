@@ -1,0 +1,83 @@
+---
+name: Build and Push Golang Image to AWS ECR
+
+on:
+  push:
+    branches:
+      - stage
+      - development
+      - main
+
+jobs:
+  build-and-push:
+    name: Build and Push to ECR
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Generate version tag
+      id: version
+      run: |
+        # Generate version based on branch and run number
+        if [ ${{ github.ref }} == 'refs/heads/main' ]; then
+          VERSION="v1.0.${{ github.run_number }}"
+        elif [ ${{ github.ref }} == 'refs/heads/stage' ]; then
+          VERSION="v1.0.${{ github.run_number }}-stage"
+        elif [ ${{ github.ref }} == 'refs/heads/development' ]; then
+          VERSION="v1.0.${{ github.run_number }}-dev"
+        fi
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Generated version: $VERSION"
+
+    - name: Build, Tag, and Push the Image to Amazon ECR
+      id: build-image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPO: wallstz/roro-local-server
+        VERSION: ${{ steps.version.outputs.version }}
+      run: |
+        # Determine the secondary "latest" tag based on branch
+        if [ ${{ github.ref }} == 'refs/heads/main' ]; then
+          LATEST_TAG="latest"
+        elif [ ${{ github.ref }} == 'refs/heads/stage' ]; then
+          LATEST_TAG="latest-stage"
+        elif [ ${{ github.ref }} == 'refs/heads/development' ]; then
+          LATEST_TAG="latest-dev"
+        fi
+        
+        echo "Building for linux/arm64 with tags: $VERSION and $LATEST_TAG"
+
+        # Build and push multi-platform (specifically arm64 for Pi)
+        docker buildx build \
+          --platform linux/arm64 \
+          --build-arg user=auth_brentles \
+          --build-arg uid=12000 \
+          -t $ECR_REGISTRY/$ECR_REPO:$VERSION \
+          -t $ECR_REGISTRY/$ECR_REPO:$LATEST_TAG \
+          --push .
+        
+        echo "image=$ECR_REGISTRY/$ECR_REPO:$VERSION" >> $GITHUB_OUTPUT
+
+    - name: Summary
+      run: |
+        echo "🚀 Build completed successfully!"
+        echo "📦 Image: ${{ steps.build-image.outputs.image }}"
+        echo "🏷️  Version: ${{ steps.version.outputs.version }}"
