@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  db:
+    image: mariadb:10.6
+    container_name: roro-mariadb
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persist database data across container restarts
+      - db_data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  phpmyadmin:
+    image: phpmyadmin:latest
+    container_name: roro_phpmyadmin
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PMA_HOST=db
+      - PMA_PORT=3306
+      - UPLOAD_LIMIT=300M
+    ports:
+      - "8080:80"
+    depends_on:
+      - db
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: roro_app
+    restart: unless-stopped
+    ports:
+      - "4400:4400"
+    env_file:
+      - src/.env
+    environment:
+      # Override the DB host from src/.env because in docker the database is reachable via 'db' instead of 'localhost'
+      - MYSQL_HOST=db
+    volumes:
+      # Keep the media files synchronized/persisted
+      - ./src/media_data:/app/src/media_data
+    depends_on:
+      - db
+
+volumes:
+  db_data:

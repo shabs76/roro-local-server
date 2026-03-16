@@ -1,6 +1,6 @@
 # Dockerfile
 # FROM golang:1.24.2-alpine3.20
-FROM golang:1.25.1-alpine AS builder
+FROM golang:1.25.4-alpine AS builder
 
 # Install build dependencies
 RUN apk update && apk add --no-cache gcc libc-dev libwebp-dev
