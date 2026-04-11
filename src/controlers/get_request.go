@@ -1966,6 +1966,6 @@ func GetInspectedPackageDetails(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"state": constants.SuccessState,
-		"data":  packageDetails,
+		"data":  packageDetails[0],
 	})
 }

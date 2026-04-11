@@ -754,6 +754,50 @@ func InsertPackageInspection(req manifest.PackageInspectionSaveRequest, userId s
 			Adv:   "none",
 		}
 	}
+
+	// add media if present
+	if len(req.Media) > 0 {
+		// delete existing media for the package to avoid duplicates, since we are doing a full replace for media
+		delMediaQr := `DELETE FROM package_gallery WHERE package_id = ?`
+		_, err := tx.ExecContext(ctx, delMediaQr, req.PackageId)
+		if err != nil {
+			log.Printf("Failed to delete existing media: %v", err)
+			return &constants.AnswerState{
+				State: constants.ErrorState,
+				Data:  "Failed to delete existing media",
+				Adv:   "none",
+			}
+		}
+
+		mediaQr := `INSERT INTO package_gallery(media_id, media_link, media_type, remark, package_id, status) VALUES (?,?,?,?,?,?)`
+		mediaStmt, err := tx.PrepareContext(ctx, mediaQr)
+		if err != nil {
+			log.Printf("Media statement preparation error: %v", err)
+			return &constants.AnswerState{
+				State: constants.ErrorState,
+				Data:  "Failed to prepare media statement",
+				Adv:   "none",
+			}
+		}
+		defer mediaStmt.Close()
+
+		for _, media := range req.Media {
+			mediaId := specials.RandomString(24, "_PKG_INSP_MEDIA")
+			vals := []any{
+				mediaId, media.MediaLink, media.MediaType, media.Remark, req.PackageId, manifest.GenStatus.Active,
+			}
+			_, err := mediaStmt.ExecContext(ctx, vals...)
+			if err != nil {
+				log.Printf("Media statement execution error: %v", err)
+				return &constants.AnswerState{
+					State: constants.ErrorState,
+					Data:  "Failed to save media information",
+					Adv:   "none",
+				}
+			}
+		}
+	}
+
 	committed = true
 	if err := tx.Commit(); err != nil {
 		log.Printf("Transaction commit error: %v", err)

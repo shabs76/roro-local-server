@@ -124,6 +124,7 @@ func AddSingleVehicleToManifest(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, st)
 		return
 	}
+	st.Adv = id
 	c.JSON(http.StatusOK, st)
 }
 

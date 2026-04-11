@@ -65,9 +65,16 @@ type AddPackageRequest struct {
 }
 
 type PackageInspectionSaveRequest struct {
-	PackageId          string `json:"packageId" binding:"required"`
-	PackageImage       string `json:"packageImage" binding:"required"`
-	TypeId             string `json:"typeId" binding:"required"`
-	InspectionTime     string `json:"inspectionTime" binding:"required"`
-	InspectionStatusId string `json:"inspectionStatusId" binding:"required"`
+	PackageId          string                     `json:"packageId" binding:"required"`
+	PackageImage       string                     `json:"packageImage" binding:"required"`
+	TypeId             string                     `json:"typeId" binding:"required"`
+	InspectionTime     string                     `json:"inspectionTime" binding:"required"`
+	InspectionStatusId string                     `json:"inspectionStatusId" binding:"required"`
+	Media              []PackageExtraMediaRequest `json:"media" binding:"required"`
+}
+
+type PackageExtraMediaRequest struct {
+	MediaLink string `json:"mediaLink" binding:"required"`
+	MediaType string `json:"mediaType" binding:"required" oneof:"image,video,pdf"`
+	Remark    string `json:"remark" binding:"required"`
 }

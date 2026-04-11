@@ -163,3 +163,35 @@ func GetFile(c *gin.Context) {
 	// Stream the file
 	http.ServeContent(c.Writer, c.Request, filename, fileInfo.ModTime(), file)
 }
+
+// PlayMedia streams a file specifically for video/audio players (like Flutter video_player).
+// It supports HTTP byte-range requests and serves the file inline instead of as an attachment.
+func PlayMedia(c *gin.Context) {
+	rawPath := c.Query("url")
+	if rawPath == "" {
+		rawPath = c.Param("url") // fallback if mapped as path param
+	}
+
+	if rawPath == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"state": constants.ErrorState, "data": "File URL is required"})
+		return
+	}
+
+	// Clean up path found in URL
+	relativePath := filepath.Clean(rawPath)
+	if strings.Contains(relativePath, "..") {
+		c.JSON(http.StatusBadRequest, gin.H{"state": constants.ErrorState, "data": "Invalid file path"})
+		return
+	}
+
+	fullPath := filepath.Join(constants.MediaBaseDir, relativePath)
+
+	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+		c.JSON(http.StatusNotFound, gin.H{"state": constants.ErrorState, "data": "File not found"})
+		return
+	}
+
+	// Gin's c.File automatically handles 'Accept-Ranges', 'Content-Range',
+	// and 'Content-Type' headers which are required by the Flutter video_player.
+	c.File(fullPath)
+}

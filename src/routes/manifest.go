@@ -14,6 +14,7 @@ func SetupManifestRoutes(router *gin.Engine) {
 		{
 			media.POST("/upload/file", controlers.UploadMedia)
 			media.GET("/get/file", controlers.GetFile)
+			media.GET("/get/full/file", controlers.PlayMedia)
 		}
 		// manifest routes
 		mani := manifestGroup.Group("/manifest")

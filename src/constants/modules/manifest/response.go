@@ -148,29 +148,38 @@ type PackageManifestInfo struct {
 }
 
 type PackageInspectionDetails struct {
-	ManifestId            string `json:"manifestId" binding:"required"`
-	PackageId             string `json:"packageId" binding:"required"`
-	BLNumber              string `json:"blNumber" binding:"required"`
-	PackageNumber         string `json:"packageNumber" binding:"required"`
-	Description           string `json:"description" binding:"required"`
-	IsInspected           string `json:"isInspected" binding:"required"`
-	InspectionId          string `json:"inspectionId" binding:"required"`
-	TypeId                string `json:"typeId" binding:"required"`
-	TypeName              string `json:"typeName" binding:"required"`
-	Picture               string `json:"picture" binding:"required"`
-	InspectionStatusId    string `json:"inspectionStatusId" binding:"required"`
-	InspectionStatus      string `json:"inspectionStatus" binding:"required"`
-	InspectionDescription string `json:"inspectionDescription" binding:"required"`
-	InspectionNumber      int    `json:"inspectionNumber" binding:"required"`
-	InspectionTime        string `json:"inspectionTime" binding:"required"`
-	CreationTime          string `json:"creationTime" binding:"required"`
-	UserId                string `json:"userId" binding:"required"`
-	UserFname             string `json:"userFirstName" binding:"required"`
-	UserLname             string `json:"userLastName" binding:"required"`
-	UserPhone             string `json:"userPhone" binding:"required"`
-	IsAddedLater          string `json:"isAddedLater"`
+	ManifestId            string                `json:"manifestId" binding:"required"`
+	PackageId             string                `json:"packageId" binding:"required"`
+	BLNumber              string                `json:"blNumber" binding:"required"`
+	PackageNumber         string                `json:"packageNumber" binding:"required"`
+	Description           string                `json:"description" binding:"required"`
+	IsInspected           string                `json:"isInspected" binding:"required"`
+	InspectionId          string                `json:"inspectionId" binding:"required"`
+	TypeId                string                `json:"typeId" binding:"required"`
+	TypeName              string                `json:"typeName" binding:"required"`
+	Picture               string                `json:"picture" binding:"required"`
+	InspectionStatusId    string                `json:"inspectionStatusId" binding:"required"`
+	InspectionStatus      string                `json:"inspectionStatus" binding:"required"`
+	InspectionDescription string                `json:"inspectionDescription" binding:"required"`
+	InspectionNumber      int                   `json:"inspectionNumber" binding:"required"`
+	InspectionTime        string                `json:"inspectionTime" binding:"required"`
+	CreationTime          string                `json:"creationTime" binding:"required"`
+	UserId                string                `json:"userId" binding:"required"`
+	UserFname             string                `json:"userFirstName" binding:"required"`
+	UserLname             string                `json:"userLastName" binding:"required"`
+	UserPhone             string                `json:"userPhone" binding:"required"`
+	IsAddedLater          string                `json:"isAddedLater"`
+	Media                 []PackageMediaDetails `json:"media" binding:"required"`
 }
 
+type PackageMediaDetails struct {
+	MediaId   string `json:"mediaId" binding:"required"`
+	PackageId string `json:"packageId" binding:"required"`
+	MediaType string `json:"mediaType" binding:"required"`
+	MediaLink string `json:"mediaLink" binding:"required"`
+	Remark    string `json:"remark" binding:"required"`
+	Status    string `json:"status" binding:"required"`
+}
 type VehiclesDetailsAndInspection struct {
 	VehicleId           string  `json:"vehicleId" binding:"required"`
 	ManifestId          string  `json:"manifestId" binding:"required"`

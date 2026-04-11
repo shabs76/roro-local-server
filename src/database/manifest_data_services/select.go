@@ -1,6 +1,7 @@
 package manifestdataservices
 
 import (
+	"database/sql"
 	"log/slog"
 
 	"github.com/shabs76/roro-local-server/constants"
@@ -1059,7 +1060,7 @@ func GetCompleteSummary(manifestId string) (*constants.AnswerState, manifest.Veh
 
 func SelectPackageInspectionData(subQuery string, vals []any) (*constants.AnswerState, []manifest.PackageInspectionDetails) {
 	qr := `SELECT 
-			inspection_id, 
+			packages_inspection.inspection_id, 
 			packages_inspection.package_id, 
 			package_types.type_id, 
 			package_types.type_name,
@@ -1079,13 +1080,19 @@ func SelectPackageInspectionData(subQuery string, vals []any) (*constants.Answer
             users.fname,
             users.lname,
             users.phone,
-			manifest_packages.is_added_later
+			manifest_packages.is_added_later,
+			package_gallery.media_id,
+			package_gallery.media_link,
+			package_gallery.media_type,
+			package_gallery.remark,
+			package_gallery.status
 		FROM 
 			packages_inspection
 		INNER JOIN manifest_packages ON manifest_packages.package_id = packages_inspection.package_id
 		INNER JOIN package_types ON package_types.type_id = packages_inspection.type_id
 		INNER JOIN users ON users.user_id = packages_inspection.user_id
 		INNER JOIN packages_inspection_status ON packages_inspection_status.status_id = packages_inspection.inspection_status
+		LEFT JOIN package_gallery ON package_gallery.package_id = packages_inspection.package_id
 		WHERE ` + subQuery
 
 	st, res := gendb.SelectGeneral(qr, vals)
@@ -1096,14 +1103,17 @@ func SelectPackageInspectionData(subQuery string, vals []any) (*constants.Answer
 
 	defer res.Close()
 
-	rows := []manifest.PackageInspectionDetails{}
+	packageMap := make(map[string]*manifest.PackageInspectionDetails)
+	var orderedKeys []string
 
 	for res.Next() {
 		var row manifest.PackageInspectionDetails
+		var mediaId, mediaLink, mediaType, mediaRemark, mediaStatus sql.NullString
 
 		ers := res.Scan(&row.InspectionId, &row.PackageId, &row.TypeId, &row.TypeName, &row.Picture, &row.InspectionStatusId, &row.InspectionStatus, &row.InspectionDescription,
 			&row.InspectionNumber, &row.InspectionTime, &row.CreationTime, &row.ManifestId, &row.BLNumber, &row.PackageNumber, &row.Description, &row.IsInspected,
 			&row.UserId, &row.UserFname, &row.UserLname, &row.UserPhone, &row.IsAddedLater,
+			&mediaId, &mediaLink, &mediaType, &mediaRemark, &mediaStatus,
 		)
 
 		if ers != nil {
@@ -1114,7 +1124,41 @@ func SelectPackageInspectionData(subQuery string, vals []any) (*constants.Answer
 				Adv:   "none",
 			}, nil
 		}
-		rows = append(rows, row)
+
+		if pkg, exists := packageMap[row.PackageId]; exists {
+			if mediaId.Valid {
+				pkg.Media = append(pkg.Media, manifest.PackageMediaDetails{
+					MediaId:   mediaId.String,
+					PackageId: pkg.PackageId,
+					MediaLink: mediaLink.String,
+					MediaType: mediaType.String,
+					Remark:    mediaRemark.String,
+					Status:    mediaStatus.String,
+				})
+			}
+		} else {
+			if mediaId.Valid {
+				row.Media = []manifest.PackageMediaDetails{
+					{
+						MediaId:   mediaId.String,
+						PackageId: row.PackageId,
+						MediaLink: mediaLink.String,
+						MediaType: mediaType.String,
+						Remark:    mediaRemark.String,
+						Status:    mediaStatus.String,
+					},
+				}
+			} else {
+				row.Media = []manifest.PackageMediaDetails{}
+			}
+			packageMap[row.PackageId] = &row
+			orderedKeys = append(orderedKeys, row.PackageId)
+		}
+	}
+
+	rows := make([]manifest.PackageInspectionDetails, 0, len(orderedKeys))
+	for _, key := range orderedKeys {
+		rows = append(rows, *packageMap[key])
 	}
 
 	return &constants.AnswerState{
