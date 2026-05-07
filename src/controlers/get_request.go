@@ -523,7 +523,7 @@ func GetVehicleListOfManifest(c *gin.Context) {
 	subQr := " `manifest_id` = ? "
 	vals := []any{mId}
 
-	switch reqType {
+	switch strings.TrimSpace(reqType) {
 	case "discharged":
 		subQr += " AND `discharged_status` = ? "
 		vals = append(vals, "yes")
