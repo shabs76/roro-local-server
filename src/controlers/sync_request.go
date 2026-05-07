@@ -2,7 +2,6 @@ package controlers
 
 import (
 	"fmt"
-	"log"
 	"log/slog"
 	"net/http"
 	"os"
@@ -284,7 +283,7 @@ func ManifestDataSyncSSE(c *gin.Context) {
 
 			// Execute Task
 			err := task.Execute()
-			log.Printf("Completed task: %s for manifest ID: %s\n", task.Name, manifestId)
+			slog.Info("Completed task", "task", task.Name, "manifestId", manifestId)
 
 			if err != nil {
 				// Report Error

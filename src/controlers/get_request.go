@@ -531,10 +531,10 @@ func GetVehicleListOfManifest(c *gin.Context) {
 		subQr += " AND `discharged_status` != ? "
 		vals = append(vals, "yes")
 	case "inspected":
-		subQr += " AND `inspection_status` = ? "
+		subQr += " AND (`inspection_status` = ? OR EXISTS (SELECT 1 FROM `vehicles_talling` WHERE `vehicles_talling`.`vehicle_id` = `manifest_vehicles`.`vehicle_id`)) "
 		vals = append(vals, "yes")
 	case "uninspected":
-		subQr += " AND `inspection_status` != ? "
+		subQr += " AND `inspection_status` != ? AND NOT EXISTS (SELECT 1 FROM `vehicles_talling` WHERE `vehicles_talling`.`vehicle_id` = `manifest_vehicles`.`vehicle_id`) "
 		vals = append(vals, "yes")
 	}
 

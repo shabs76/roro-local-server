@@ -3,7 +3,8 @@ package manifestdataservices
 import (
 	"context"
 	"database/sql"
-	"log"
+	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/shabs76/roro-local-server/constants"
@@ -120,10 +121,10 @@ func InsertPackageInspectionStatus(data []manifest.PackageInspectionStatusDetail
 
 // manifest data insertion functions
 func InsertManifestDetails(data []manifest.ManifestData) (st *constants.AnswerState) {
-	log.Println(data[0])
+	slog.Info(fmt.Sprint(data[0]))
 	qr := "INSERT INTO `manifest`(`manifest_id`, `manifest_name`, `client_id`, `vessel_name`, `voyage_no`, `berth_no`, `arrival_date`, `received_date`, `uploaded_date`) VALUES (?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE `manifest_name`=VALUES(`manifest_name`), `client_id`=VALUES(`client_id`), `vessel_name`=VALUES(`vessel_name`), `voyage_no`=VALUES(`voyage_no`), `berth_no`=VALUES(`berth_no`), `arrival_date`=VALUES(`arrival_date`), `received_date`=VALUES(`received_date`), `uploaded_date`=VALUES(`uploaded_date`)"
 	for i, detail := range data {
-		log.Printf("Processing manifest detail %d/%d: Manifest ID %s\n", i+1, len(data), detail.ManifestId)
+		slog.Info(fmt.Sprintf("Processing manifest detail %d/%d: Manifest ID %s", i+1, len(data), detail.ManifestId))
 		vals := []any{
 			detail.ManifestId,
 			detail.ManifestName,
@@ -139,7 +140,7 @@ func InsertManifestDetails(data []manifest.ManifestData) (st *constants.AnswerSt
 		if stx.State != constants.SuccessState {
 			return stx
 		}
-		log.Printf("Successfully inserted manifest detail %d/%d: Manifest ID %s\n", i+1, len(data), detail.ManifestId)
+		slog.Info(fmt.Sprintf("Successfully inserted manifest detail %d/%d: Manifest ID %s", i+1, len(data), detail.ManifestId))
 	}
 
 	return &constants.AnswerState{State: constants.SuccessState, Data: "Manifest details were successfully synced", Adv: "none"}
@@ -164,7 +165,9 @@ func InsertDeckStowagePlanDetails(data []manifest.DeckStowagePlanDetails) (st *c
 }
 
 func InsertVehiclesDetails(data []manifest.VehiclesDetailsToShow, isAddedLater bool) (st *constants.AnswerState) {
-	qr := "INSERT INTO `manifest_vehicles`(`vehicle_id`, `manifest_id`, `chasis_number`, `model`, `description`, `weight`, `bl_no`, `creation_date`, `inspection_status`, `tallied_status`, `discharged_status`, `is_overland`, `is_added_later`, `inspection_time`, `tallied_time`, `discharge_time`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE `manifest_id`=VALUES(`manifest_id`), `chasis_number`=VALUES(`chasis_number`), `model`=VALUES(`model`), `description`=VALUES(`description`), `weight`=VALUES(`weight`), `bl_no`=VALUES(`bl_no`), `creation_date`=VALUES(`creation_date`), `inspection_status`=VALUES(`inspection_status`), `tallied_status`=VALUES(`tallied_status`), `discharged_status`=VALUES(`discharged_status`), `is_overland`=VALUES(`is_overland`), `is_added_later`=VALUES(`is_added_later`), `inspection_time`=VALUES(`inspection_time`), `tallied_time`=VALUES(`tallied_time`), `discharge_time`=VALUES(`discharge_time`)"
+	// NOTE: inspection_status, tallied_status, inspection_time, tallied_time are intentionally excluded
+	// from ON DUPLICATE KEY UPDATE — these fields are managed locally and must not be overwritten by remote syncs.
+	qr := "INSERT INTO `manifest_vehicles`(`vehicle_id`, `manifest_id`, `chasis_number`, `model`, `description`, `weight`, `bl_no`, `creation_date`, `inspection_status`, `tallied_status`, `discharged_status`, `is_overland`, `is_added_later`, `inspection_time`, `tallied_time`, `discharge_time`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE `manifest_id`=VALUES(`manifest_id`), `chasis_number`=VALUES(`chasis_number`), `model`=VALUES(`model`), `description`=VALUES(`description`), `weight`=VALUES(`weight`), `bl_no`=VALUES(`bl_no`), `creation_date`=VALUES(`creation_date`), `discharged_status`=VALUES(`discharged_status`), `is_overland`=VALUES(`is_overland`), `is_added_later`=VALUES(`is_added_later`), `discharge_time`=VALUES(`discharge_time`)"
 	isAddedLaterVal := "no"
 	if isAddedLater {
 		isAddedLaterVal = "yes"
@@ -252,7 +255,7 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 
 	db, er := gendb.InitDb()
 	if er != nil {
-		log.Printf("Database connection error: %v", er)
+		slog.Error(fmt.Sprintf("Database connection error: %v", er))
 		return &constants.AnswerState{
 			State: constants.ErrorState,
 			Data:  er.Error(),
@@ -266,7 +269,7 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 		Isolation: sql.LevelReadCommitted,
 	})
 	if err != nil {
-		log.Printf("Transaction start error: %v", err)
+		slog.Error(fmt.Sprintf("Transaction start error: %v", err))
 		return &constants.AnswerState{
 			State: constants.ErrorState,
 			Data:  "Failed to start transaction",
@@ -278,7 +281,7 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 	defer func() {
 		if !committed {
 			if err := tx.Rollback(); err != nil && err != sql.ErrTxDone {
-				log.Printf("Failed to rollback transaction: %v", err)
+				slog.Error(fmt.Sprintf("Failed to rollback transaction: %v", err))
 			}
 		}
 	}()
@@ -355,7 +358,7 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 
 	_, err = tx.ExecContext(ctx, tallyQr, tallyVals...)
 	if err != nil {
-		log.Printf("Tally insert error: %v", err)
+		slog.Error(fmt.Sprintf("Tally insert error: %v", err))
 		return &constants.AnswerState{
 			State: constants.ErrorState,
 			Data:  "Failed to save tally details",
@@ -370,7 +373,7 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 
 	_, err = tx.ExecContext(ctx, tallyStQr, "yes", "yes", req.InspectionTime, req.InspectionTime, req.ModelName, req.VehicleId)
 	if err != nil {
-		log.Printf("Status update error: %v", err)
+		slog.Error(fmt.Sprintf("Status update error: %v", err))
 		return &constants.AnswerState{
 			State: constants.ErrorState,
 			Data:  "Failed to update vehicle status",
@@ -391,7 +394,7 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
         check_time = NOW()
     `)
 	if err != nil {
-		log.Printf("Inspection statement prep error: %v", err)
+		slog.Error(fmt.Sprintf("Inspection statement prep error: %v", err))
 		return &constants.AnswerState{
 			State: constants.ErrorState,
 			Data:  "Failed to prepare inspection statement",
@@ -408,7 +411,7 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 		}
 		_, err := inspStmt.ExecContext(ctx, vals...)
 		if err != nil {
-			log.Printf("Inspection insert error: %v", err)
+			slog.Error(fmt.Sprintf("Inspection insert error: %v", err))
 			return &constants.AnswerState{
 				State: constants.ErrorState,
 				Data:  "Failed to save inspection information",
@@ -419,7 +422,7 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 
 	// commit the transaction here to ensure all inspections are saved before images
 	if err := tx.Commit(); err != nil {
-		log.Printf("Transaction commit error: %v", err)
+		slog.Error(fmt.Sprintf("Transaction commit error: %v", err))
 		return &constants.AnswerState{
 			State: constants.ErrorState,
 			Data:  "Failed to commit changes. Please try again.",
@@ -431,7 +434,7 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 		Isolation: sql.LevelReadCommitted,
 	})
 	if err != nil {
-		log.Printf("Transaction start error: %v", err)
+		slog.Error(fmt.Sprintf("Transaction start error: %v", err))
 		return &constants.AnswerState{
 			State: constants.ErrorState,
 			Data:  "Failed to start transaction",
@@ -451,7 +454,7 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
             creation_time = NOW()
         `)
 		if err != nil {
-			log.Printf("Image statement prep error: %v", err)
+			slog.Error(fmt.Sprintf("Image statement prep error: %v", err))
 			return &constants.AnswerState{
 				State: constants.ErrorState,
 				Data:  "Failed to prepare image statement",
@@ -468,7 +471,7 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 				}
 				_, err := inspImgStmt.ExecContext(ctx, vals...)
 				if err != nil {
-					log.Printf("Image insert error: %v", err)
+					slog.Error(fmt.Sprintf("Image insert error: %v", err))
 					return &constants.AnswerState{
 						State: constants.ErrorState,
 						Data:  "Failed to save image information",
@@ -485,7 +488,7 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 		delPkgQr := `DELETE FROM onboard_packages WHERE vehicle_id = ?`
 		_, err := tx.ExecContext(ctx, delPkgQr, req.VehicleId)
 		if err != nil {
-			log.Printf("Failed to delete existing onboard packages: %v", err)
+			slog.Error(fmt.Sprintf("Failed to delete existing onboard packages: %v", err))
 			return &constants.AnswerState{
 				State: constants.ErrorState,
 				Data:  "Failed to delete existing onboard packages",
@@ -497,7 +500,7 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 		(package_id, title, remark, vehicle_id) 
 		VALUES (?,?,?,?)`)
 		if err != nil {
-			log.Printf("Failed to create on board package statement: %v", err)
+			slog.Error(fmt.Sprintf("Failed to create on board package statement: %v", err))
 			return &constants.AnswerState{
 				State: constants.ErrorState,
 				Data:  "Failed to create onboard package statement",
@@ -510,7 +513,7 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 		(media_id, media_type, media_link, package_id) 
 		VALUES (?,?,?,?)`)
 		if err != nil {
-			log.Printf("Failed to create on board package media statement %v", err)
+			slog.Error(fmt.Sprintf("Failed to create on board package media statement %v", err))
 			return &constants.AnswerState{
 				State: constants.ErrorState,
 				Data:  "Failed to create onboard package media statement",
@@ -526,7 +529,7 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 
 			_, err := packStmt.ExecContext(ctx, vals...)
 			if err != nil {
-				log.Printf("Failed to save on board package information: %v", err)
+				slog.Error(fmt.Sprintf("Failed to save on board package information: %v", err))
 				return &constants.AnswerState{
 					State: constants.ErrorState,
 					Data:  "Failed to save on board packege information",
@@ -542,7 +545,7 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 
 				_, err := packMeStmt.ExecContext(ctx, valsMed...)
 				if err != nil {
-					log.Printf("Failed to save onboard package media information: %v", err)
+					slog.Error(fmt.Sprintf("Failed to save onboard package media information: %v", err))
 					return &constants.AnswerState{
 						State: constants.ErrorState,
 						Data:  "Failed to save onboard package media information",
@@ -566,7 +569,7 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
             remark_time = NOW()
         `)
 		if err != nil {
-			log.Printf("Remarks statement prep error: %v", err)
+			slog.Error(fmt.Sprintf("Remarks statement prep error: %v", err))
 			return &constants.AnswerState{
 				State: constants.ErrorState,
 				Data:  "Failed to prepare remarks statement",
@@ -582,7 +585,7 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 			}
 			_, err := rmkStmt.ExecContext(ctx, vals...)
 			if err != nil {
-				log.Printf("Remark insert error: %v", err)
+				slog.Error(fmt.Sprintf("Remark insert error: %v", err))
 				return &constants.AnswerState{
 					State: constants.ErrorState,
 					Data:  "Failed to save remarks information",
@@ -598,7 +601,7 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 		delMediaQr := `DELETE FROM vehicle_galllery WHERE vehicle_id = ?`
 		_, err := tx.ExecContext(ctx, delMediaQr, req.VehicleId)
 		if err != nil {
-			log.Printf("Failed to delete existing media: %v", err)
+			slog.Error(fmt.Sprintf("Failed to delete existing media: %v", err))
 			return &constants.AnswerState{
 				State: constants.ErrorState,
 				Data:  "Failed to delete existing media",
@@ -612,7 +615,7 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 		`)
 
 		if err != nil {
-			log.Printf("Media statement prep error: %v", err)
+			slog.Error(fmt.Sprintf("Media statement prep error: %v", err))
 			return &constants.AnswerState{
 				State: constants.ErrorState,
 				Data:  "Failed to prepare media statement",
@@ -629,7 +632,7 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 
 			_, err := mediaStmt.ExecContext(ctx, vals...)
 			if err != nil {
-				log.Printf("Media insert has failed due to: %v", err)
+				slog.Error(fmt.Sprintf("Media insert has failed due to: %v", err))
 				return &constants.AnswerState{
 					State: constants.ErrorState,
 					Data:  "Failed to save vehicle media",
@@ -641,7 +644,7 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 
 	// Commit transaction
 	if err := tx.Commit(); err != nil {
-		log.Printf("Transaction commit error: %v", err)
+		slog.Error(fmt.Sprintf("Transaction commit error: %v", err))
 		return &constants.AnswerState{
 			State: constants.ErrorState,
 			Data:  "Failed to commit changes. Please try again.",
@@ -675,7 +678,7 @@ func InsertPackageInspection(req manifest.PackageInspectionSaveRequest, userId s
 
 	db, er := gendb.InitDb()
 	if er != nil {
-		log.Printf("Database connection error: %v", er)
+		slog.Error(fmt.Sprintf("Database connection error: %v", er))
 		return &constants.AnswerState{
 			State: constants.ErrorState,
 			Data:  er.Error(),
@@ -689,7 +692,7 @@ func InsertPackageInspection(req manifest.PackageInspectionSaveRequest, userId s
 		Isolation: sql.LevelReadCommitted,
 	})
 	if err != nil {
-		log.Printf("Transaction start error: %v", err)
+		slog.Error(fmt.Sprintf("Transaction start error: %v", err))
 		return &constants.AnswerState{
 			State: constants.ErrorState,
 			Data:  "Failed to start transaction",
@@ -701,7 +704,7 @@ func InsertPackageInspection(req manifest.PackageInspectionSaveRequest, userId s
 	defer func() {
 		if !committed {
 			if err := tx.Rollback(); err != nil && err != sql.ErrTxDone {
-				log.Printf("Failed to rollback transaction: %v", err)
+				slog.Error(fmt.Sprintf("Failed to rollback transaction: %v", err))
 			}
 		}
 	}()
@@ -724,7 +727,7 @@ func InsertPackageInspection(req manifest.PackageInspectionSaveRequest, userId s
 
 	inspeStmt, err := tx.PrepareContext(context.Background(), qr)
 	if err != nil {
-		log.Printf("Statement preparation error: %v", err)
+		slog.Error(fmt.Sprintf("Statement preparation error: %v", err))
 		return &constants.AnswerState{
 			State: constants.ErrorState,
 			Data:  "Failed to prepare statement",
@@ -735,7 +738,7 @@ func InsertPackageInspection(req manifest.PackageInspectionSaveRequest, userId s
 
 	_, err = inspeStmt.ExecContext(context.Background(), vals...)
 	if err != nil {
-		log.Printf("Statement execution error: %v", err)
+		slog.Error(fmt.Sprintf("Statement execution error: %v", err))
 		return &constants.AnswerState{
 			State: constants.ErrorState,
 			Data:  "Failed to execute statement",
@@ -747,7 +750,7 @@ func InsertPackageInspection(req manifest.PackageInspectionSaveRequest, userId s
 	manifestUpdateQr := `UPDATE manifest_packages SET is_inspected = ? WHERE package_id = ?`
 	_, err = tx.ExecContext(ctx, manifestUpdateQr, manifest.InspectionStatus.Yes, req.PackageId)
 	if err != nil {
-		log.Printf("Manifest update error: %v", err)
+		slog.Error(fmt.Sprintf("Manifest update error: %v", err))
 		return &constants.AnswerState{
 			State: constants.ErrorState,
 			Data:  "Failed to update package manifest inspection status",
@@ -761,7 +764,7 @@ func InsertPackageInspection(req manifest.PackageInspectionSaveRequest, userId s
 		delMediaQr := `DELETE FROM package_gallery WHERE package_id = ?`
 		_, err := tx.ExecContext(ctx, delMediaQr, req.PackageId)
 		if err != nil {
-			log.Printf("Failed to delete existing media: %v", err)
+			slog.Error(fmt.Sprintf("Failed to delete existing media: %v", err))
 			return &constants.AnswerState{
 				State: constants.ErrorState,
 				Data:  "Failed to delete existing media",
@@ -772,7 +775,7 @@ func InsertPackageInspection(req manifest.PackageInspectionSaveRequest, userId s
 		mediaQr := `INSERT INTO package_gallery(media_id, media_link, media_type, remark, package_id, status) VALUES (?,?,?,?,?,?)`
 		mediaStmt, err := tx.PrepareContext(ctx, mediaQr)
 		if err != nil {
-			log.Printf("Media statement preparation error: %v", err)
+			slog.Error(fmt.Sprintf("Media statement preparation error: %v", err))
 			return &constants.AnswerState{
 				State: constants.ErrorState,
 				Data:  "Failed to prepare media statement",
@@ -788,7 +791,7 @@ func InsertPackageInspection(req manifest.PackageInspectionSaveRequest, userId s
 			}
 			_, err := mediaStmt.ExecContext(ctx, vals...)
 			if err != nil {
-				log.Printf("Media statement execution error: %v", err)
+				slog.Error(fmt.Sprintf("Media statement execution error: %v", err))
 				return &constants.AnswerState{
 					State: constants.ErrorState,
 					Data:  "Failed to save media information",
@@ -800,7 +803,7 @@ func InsertPackageInspection(req manifest.PackageInspectionSaveRequest, userId s
 
 	committed = true
 	if err := tx.Commit(); err != nil {
-		log.Printf("Transaction commit error: %v", err)
+		slog.Error(fmt.Sprintf("Transaction commit error: %v", err))
 		return &constants.AnswerState{
 			State: constants.ErrorState,
 			Data:  "Failed to commit changes. Please try again.",

@@ -1,7 +1,6 @@
 package controlers
 
 import (
-	"log"
 	"log/slog"
 	"net/http"
 	"time"
@@ -31,7 +30,6 @@ func SaveVehicleInspectionDetails(c *gin.Context) {
 
 	if er := c.ShouldBindJSON(&req); er != nil {
 		slog.Error(er.Error())
-		log.Println(c.Request.Body)
 		c.JSON(http.StatusBadRequest, gin.H{"state": constants.ErrorState, "data": "Invalid data was sent"})
 		return
 	}
@@ -80,7 +78,6 @@ func AddSingleVehicleToManifest(c *gin.Context) {
 
 	if er := c.ShouldBindJSON(&req); er != nil {
 		slog.Error(er.Error())
-		log.Println(c.Request.Body)
 		c.JSON(http.StatusBadRequest, gin.H{"state": constants.ErrorState, "data": "Invalid data was sent"})
 		return
 	}
