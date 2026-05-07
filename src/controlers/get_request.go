@@ -400,13 +400,14 @@ func populateManifestAggregates(manifestIDs []string, manifestArgs []any, aggreg
 			GROUP BY manifest_id
 		) pkg ON pkg.manifest_id = m.manifest_id
 		LEFT JOIN (
-			SELECT manifest_id,
+			SELECT mv.manifest_id,
 			       COUNT(*) AS total_vehicles,
-			       SUM(CASE WHEN inspection_status = ? THEN 1 ELSE 0 END) AS inspected_vehicles,
-			       SUM(CASE WHEN discharged_status = ? THEN 1 ELSE 0 END) AS discharged_vehicles
-			FROM manifest_vehicles
-			WHERE manifest_id IN (%s)
-			GROUP BY manifest_id
+			       COUNT(DISTINCT CASE WHEN mv.inspection_status = ? OR vt.vehicle_id IS NOT NULL THEN mv.vehicle_id END) AS inspected_vehicles,
+			       SUM(CASE WHEN mv.discharged_status = ? THEN 1 ELSE 0 END) AS discharged_vehicles
+			FROM manifest_vehicles mv
+			LEFT JOIN vehicles_talling vt ON vt.vehicle_id = mv.vehicle_id
+			WHERE mv.manifest_id IN (%s)
+			GROUP BY mv.manifest_id
 		) veh ON veh.manifest_id = m.manifest_id
 		LEFT JOIN (
 			SELECT mv.manifest_id,
