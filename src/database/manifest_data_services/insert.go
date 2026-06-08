@@ -286,6 +286,35 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 		}
 	}()
 
+	// ── Archive Block ──────────────────────────────────────────────────────────
+	// If a tally record already exists for this vehicle, move all of its active
+	// inspection data into the history tables before inserting fresh data.
+	// This preserves the full audit trail while keeping the active tables clean
+	// so that existing SELECT queries (which filter strictly by vehicle_id) always
+	// return only the most-recent inspection — no schema changes required.
+	var tallyExists bool
+	if err = tx.QueryRowContext(ctx,
+		"SELECT EXISTS(SELECT 1 FROM vehicles_talling WHERE vehicle_id = ?)",
+		req.VehicleId).Scan(&tallyExists); err != nil {
+		slog.Error(fmt.Sprintf("Archive existence check error: %v", err))
+		return &constants.AnswerState{
+			State: constants.ErrorState,
+			Data:  "Failed to check for existing tally data",
+			Adv:   "none",
+		}
+	}
+	if tallyExists {
+		if archErr := archiveVehicleData(ctx, tx, req.VehicleId); archErr != nil {
+			slog.Error(fmt.Sprintf("Archive error for vehicle %s: %v", req.VehicleId, archErr))
+			return &constants.AnswerState{
+				State: constants.ErrorState,
+				Data:  "Failed to archive existing vehicle data",
+				Adv:   "none",
+			}
+		}
+	}
+	// ── End Archive Block ──────────────────────────────────────────────────────
+
 	// Pre-generate all IDs to avoid generating them during database operations
 	tallyId := specials.RandomString(36, "_TALLY")
 
@@ -661,6 +690,114 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 	}
 }
 
+// archiveVehicleData copies all active inspection records for vehicleId into their
+// respective history tables, then deletes them from the active tables so that a fresh
+// insert can proceed without any ON DUPLICATE KEY UPDATE side-effects.
+//
+// SCHEMA REQUIREMENT: every history table must mirror its active twin column-for-column
+// with one extra column appended at the end:
+//
+//	`archived_at DATETIME NOT NULL`  ← set to NOW() by each INSERT … SELECT *, NOW()
+//
+// Quick DDL recipe per table (repeat for every table listed below):
+//
+//	CREATE TABLE vehicles_talling_history LIKE vehicles_talling;
+//	ALTER TABLE vehicles_talling_history
+//	    ADD COLUMN archived_at DATETIME NOT NULL DEFAULT '1000-01-01 00:00:00',
+//	    DROP PRIMARY KEY,            -- allow multiple historical rows per vehicle
+//	    ADD INDEX idx_vt_hist_vid (vehicle_id),
+//	    ADD INDEX idx_vt_hist_arc (archived_at);
+//
+// Apply the same pattern to:
+//
+//	vehicles_inspection_history, inspection_image_history,
+//	onboard_packages_history, onboard_packages_media_history,
+//	inspection_remarks_history, vehicle_galllery_history
+func archiveVehicleData(ctx context.Context, tx *sql.Tx, vehicleId string) error {
+	// ── INSERT phase: copy rows into history tables ─────────────────────────
+	// Each child table is archived immediately after its parent so the grouping
+	// mirrors the actual parent → child relationship.
+
+	if _, err := tx.ExecContext(ctx,
+		"INSERT INTO vehicles_inspection_history SELECT *, NOW() FROM vehicles_inspection WHERE vehicle_id = ?",
+		vehicleId); err != nil {
+		return fmt.Errorf("archive vehicles_inspection: %w", err)
+	}
+	// inspection_image_history is a child of vehicles_inspection_history (linked via inspection_id).
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO inspection_image_history
+		SELECT *, NOW() FROM inspection_image
+		WHERE inspection_id IN (
+			SELECT inspection_id FROM vehicles_inspection WHERE vehicle_id = ?
+		)`, vehicleId); err != nil {
+		return fmt.Errorf("archive inspection_image: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		"INSERT INTO onboard_packages_history SELECT *, NOW() FROM onboard_packages WHERE vehicle_id = ?",
+		vehicleId); err != nil {
+		return fmt.Errorf("archive onboard_packages: %w", err)
+	}
+	// onboard_packages_media_history is a child of onboard_packages_history (linked via package_id).
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO onboard_packages_media_history
+		SELECT *, NOW() FROM onboard_packages_media
+		WHERE package_id IN (
+			SELECT package_id FROM onboard_packages WHERE vehicle_id = ?
+		)`, vehicleId); err != nil {
+		return fmt.Errorf("archive onboard_packages_media: %w", err)
+	}
+
+	for _, qr := range [3]string{
+		"INSERT INTO inspection_remarks_history SELECT *, NOW() FROM inspection_remarks WHERE vehicle_id = ?",
+		"INSERT INTO vehicle_galllery_history SELECT *, NOW() FROM vehicle_galllery WHERE vehicle_id = ?",
+		"INSERT INTO vehicles_talling_history SELECT *, NOW() FROM vehicles_talling WHERE vehicle_id = ?",
+	} {
+		if _, err := tx.ExecContext(ctx, qr, vehicleId); err != nil {
+			return fmt.Errorf("archive table: %w", err)
+		}
+	}
+
+	// ── DELETE phase: purge active tables, child before parent ───────────────
+	// Each child is deleted immediately before its parent to satisfy FK constraints.
+
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM inspection_image
+		WHERE inspection_id IN (
+			SELECT inspection_id FROM vehicles_inspection WHERE vehicle_id = ?
+		)`, vehicleId); err != nil {
+		return fmt.Errorf("delete inspection_image: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		"DELETE FROM vehicles_inspection WHERE vehicle_id = ?", vehicleId); err != nil {
+		return fmt.Errorf("delete vehicles_inspection: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM onboard_packages_media
+		WHERE package_id IN (
+			SELECT package_id FROM onboard_packages WHERE vehicle_id = ?
+		)`, vehicleId); err != nil {
+		return fmt.Errorf("delete onboard_packages_media: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		"DELETE FROM onboard_packages WHERE vehicle_id = ?", vehicleId); err != nil {
+		return fmt.Errorf("delete onboard_packages: %w", err)
+	}
+
+	for _, qr := range [3]string{
+		"DELETE FROM inspection_remarks WHERE vehicle_id = ?",
+		"DELETE FROM vehicle_galllery WHERE vehicle_id = ?",
+		"DELETE FROM vehicles_talling WHERE vehicle_id = ?",
+	} {
+		if _, err := tx.ExecContext(ctx, qr, vehicleId); err != nil {
+			return fmt.Errorf("delete active table: %w", err)
+		}
+	}
+
+	return nil
+}
+
 // Helper function to check if any checks have images
 func hasImages(checks []manifest.InspectionCheck) bool {
 	for _, check := range checks {
@@ -814,6 +951,636 @@ func InsertPackageInspection(req manifest.PackageInspectionSaveRequest, userId s
 	return &constants.AnswerState{
 		State: constants.SuccessState,
 		Data:  "Package inspection added successfully",
+		Adv:   "none",
+	}
+}
+
+// InsertVehicleRemarksOnly inserts a list of remarks for a vehicle without touching inspection data
+func InsertVehicleRemarksOnly(req manifest.VehicleRemarksOnlyRequest, userId string) *constants.AnswerState {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	db, er := gendb.InitDb()
+	if er != nil {
+		slog.Error(fmt.Sprintf("Database connection error: %v", er))
+		return &constants.AnswerState{State: constants.ErrorState, Data: er.Error(), Adv: "none"}
+	}
+	defer db.Close()
+
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		slog.Error(fmt.Sprintf("Transaction start error: %v", err))
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to start transaction", Adv: "none"}
+	}
+
+	var committed bool
+	defer func() {
+		if !committed {
+			if err := tx.Rollback(); err != nil && err != sql.ErrTxDone {
+				slog.Error(fmt.Sprintf("Failed to rollback transaction: %v", err))
+			}
+		}
+	}()
+
+	rmkStmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO inspection_remarks
+		(remark_id, vehicle_id, remark, remark_type, image_link, remark_time)
+		VALUES (?,?,?,?,?,NOW())
+		ON DUPLICATE KEY UPDATE
+			remark = VALUES(remark),
+			remark_type = VALUES(remark_type),
+			image_link = VALUES(image_link),
+			remark_time = NOW()
+	`)
+	if err != nil {
+		slog.Error(fmt.Sprintf("Remarks statement prep error: %v", err))
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to prepare remarks statement", Adv: "none"}
+	}
+	defer rmkStmt.Close()
+
+	for _, remark := range req.Remarks {
+		remarkId := specials.RandomString(36, "_RMK")
+		_, err := rmkStmt.ExecContext(ctx, remarkId, req.VehicleId, remark.Remark, remark.RemarkType, remark.RemarkImage)
+		if err != nil {
+			slog.Error(fmt.Sprintf("Remark insert error: %v", err))
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to save remark information", Adv: "none"}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		slog.Error(fmt.Sprintf("Transaction commit error: %v", err))
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to commit changes. Please try again.", Adv: "none"}
+	}
+	committed = true
+
+	return &constants.AnswerState{State: constants.SuccessState, Data: "Remarks were successfully saved.", Adv: "none"}
+}
+
+// FixMistakenVehicleIdentification corrects the scenario where a user submitted an
+// inspection using the wrong vehicle ID. It executes entirely within a single transaction
+// and performs the following steps:
+//
+//  1. Migrate all active inspection data from wrongVehicleId → correctVehicleId.
+//  2. Mark correctVehicleId as inspected/tallied on manifest_vehicles.
+//  3. Check whether wrongVehicleId has a prior archive batch (i.e. the archive block in
+//     InsertInspectionTallyRemarks ran and displaced its legitimate historical record when
+//     the mistaken submission arrived).
+//  4. If history exists, restore the most-recent archived batch back into the active tables
+//     for wrongVehicleId and remove those rows from the history tables to prevent duplication.
+//  5. Update manifest_vehicles for wrongVehicleId accordingly (restored → 'yes'/'yes';
+//     no history → reset to 'no'/'no').
+func FixMistakenVehicleIdentification(wrongVehicleId string, correctVehicleId string) *constants.AnswerState {
+	if wrongVehicleId == "" || correctVehicleId == "" || wrongVehicleId == correctVehicleId {
+		return &constants.AnswerState{
+			State: constants.ErrorState,
+			Data:  "Invalid vehicle IDs: both must be non-empty and distinct",
+			Adv:   "none",
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	db, er := gendb.InitDb()
+	if er != nil {
+		slog.Error(fmt.Sprintf("Database connection error: %v", er))
+		return &constants.AnswerState{State: constants.ErrorState, Data: er.Error(), Adv: "none"}
+	}
+	defer db.Close()
+
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		slog.Error(fmt.Sprintf("Transaction start error: %v", err))
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to start transaction", Adv: "none"}
+	}
+
+	var committed bool
+	defer func() {
+		if !committed {
+			if err := tx.Rollback(); err != nil && err != sql.ErrTxDone {
+				slog.Error(fmt.Sprintf("Failed to rollback transaction: %v", err))
+			}
+		}
+	}()
+
+	// ── Step 1: Re-attribute active data wrongVehicleId → correctVehicleId ────
+	// inspection_image and onboard_packages_media carry no vehicle_id; they follow
+	// their parent rows automatically since inspection_id / package_id are unchanged.
+	for _, tbl := range [5]string{
+		"vehicles_talling",
+		"vehicles_inspection",
+		"onboard_packages",
+		"inspection_remarks",
+		"vehicle_galllery",
+	} {
+		if _, err = tx.ExecContext(ctx,
+			"UPDATE "+tbl+" SET vehicle_id = ? WHERE vehicle_id = ?",
+			correctVehicleId, wrongVehicleId); err != nil {
+			slog.Error(fmt.Sprintf("Migrate %s error: %v", tbl, err))
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to migrate data to correct vehicle", Adv: "none"}
+		}
+	}
+
+	// ── Step 2: Mark the correct vehicle as fully inspected / tallied ──────────
+	if _, err = tx.ExecContext(ctx,
+		"UPDATE manifest_vehicles SET inspection_status = 'yes', tallied_status = 'yes' WHERE vehicle_id = ?",
+		correctVehicleId); err != nil {
+		slog.Error(fmt.Sprintf("Status update (correct vehicle) error: %v", err))
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to update correct vehicle status", Adv: "none"}
+	}
+
+	// ── Step 3: Check for a prior archive batch on the wrong vehicle ───────────
+	// The archive block in InsertInspectionTallyRemarks stamps every archived row
+	// with NOW() at the time of archival. We use the MAX per table as the batch key.
+	var tallyArchivedAt sql.NullTime
+	if err = tx.QueryRowContext(ctx,
+		"SELECT MAX(archived_at) FROM vehicles_talling_history WHERE vehicle_id = ?",
+		wrongVehicleId).Scan(&tallyArchivedAt); err != nil {
+		slog.Error(fmt.Sprintf("History check (tally) error: %v", err))
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to check vehicle tally history", Adv: "none"}
+	}
+
+	if tallyArchivedAt.Valid {
+		// ── Step 4: Restore the most-recent archived batch ──────────────────────
+
+		// 4a. Restore vehicles_talling
+		if _, err = tx.ExecContext(ctx, `
+			INSERT INTO vehicles_talling
+			    (tally_id, vehicle_id, manifest_id, maker_id, body_id, image_link, deck_number, number_of_keys, key_type, tallied_time)
+			SELECT tally_id, vehicle_id, manifest_id, maker_id, body_id, image_link, deck_number, number_of_keys, key_type, tallied_time
+			FROM vehicles_talling_history
+			WHERE vehicle_id = ? AND archived_at = ?`,
+			wrongVehicleId, tallyArchivedAt.Time); err != nil {
+			slog.Error(fmt.Sprintf("Restore vehicles_talling error: %v", err))
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to restore tally record", Adv: "none"}
+		}
+
+		// 4b. Restore vehicles_inspection (use its own MAX to be precise)
+		var inspArchivedAt sql.NullTime
+		if err = tx.QueryRowContext(ctx,
+			"SELECT MAX(archived_at) FROM vehicles_inspection_history WHERE vehicle_id = ?",
+			wrongVehicleId).Scan(&inspArchivedAt); err != nil {
+			slog.Error(fmt.Sprintf("History check (inspection) error: %v", err))
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to check inspection history", Adv: "none"}
+		}
+		if inspArchivedAt.Valid {
+			if _, err = tx.ExecContext(ctx, `
+				INSERT INTO vehicles_inspection
+				    (inspection_id, vehicle_id, check_id, user_id, status, check_time)
+				SELECT inspection_id, vehicle_id, check_id, user_id, status, check_time
+				FROM vehicles_inspection_history
+				WHERE vehicle_id = ? AND archived_at = ?`,
+				wrongVehicleId, inspArchivedAt.Time); err != nil {
+				slog.Error(fmt.Sprintf("Restore vehicles_inspection error: %v", err))
+				return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to restore inspection records", Adv: "none"}
+			}
+
+			// 4c. Restore inspection_image via its parent inspection_id values
+			if _, err = tx.ExecContext(ctx, `
+				INSERT INTO inspection_image
+				    (image_id, image_link, inspection_id, creation_time)
+				SELECT image_id, image_link, inspection_id, creation_time
+				FROM inspection_image_history
+				WHERE inspection_id IN (
+				    SELECT inspection_id FROM vehicles_inspection_history
+				    WHERE vehicle_id = ? AND archived_at = ?
+				)`, wrongVehicleId, inspArchivedAt.Time); err != nil {
+				slog.Error(fmt.Sprintf("Restore inspection_image error: %v", err))
+				return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to restore inspection images", Adv: "none"}
+			}
+
+			// Purge the restored rows from their history tables
+			if _, err = tx.ExecContext(ctx, `
+				DELETE FROM inspection_image_history
+				WHERE inspection_id IN (
+				    SELECT inspection_id FROM vehicles_inspection_history
+				    WHERE vehicle_id = ? AND archived_at = ?
+				)`, wrongVehicleId, inspArchivedAt.Time); err != nil {
+				slog.Error(fmt.Sprintf("Purge inspection_image_history error: %v", err))
+				return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to purge inspection image history", Adv: "none"}
+			}
+			if _, err = tx.ExecContext(ctx,
+				"DELETE FROM vehicles_inspection_history WHERE vehicle_id = ? AND archived_at = ?",
+				wrongVehicleId, inspArchivedAt.Time); err != nil {
+				slog.Error(fmt.Sprintf("Purge vehicles_inspection_history error: %v", err))
+				return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to purge inspection history", Adv: "none"}
+			}
+		}
+
+		// 4d. Restore onboard_packages (use its own MAX)
+		var packArchivedAt sql.NullTime
+		if err = tx.QueryRowContext(ctx,
+			"SELECT MAX(archived_at) FROM onboard_packages_history WHERE vehicle_id = ?",
+			wrongVehicleId).Scan(&packArchivedAt); err != nil {
+			slog.Error(fmt.Sprintf("History check (packages) error: %v", err))
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to check onboard packages history", Adv: "none"}
+		}
+		if packArchivedAt.Valid {
+			if _, err = tx.ExecContext(ctx, `
+				INSERT INTO onboard_packages
+				    (package_id, title, remark, vehicle_id)
+				SELECT package_id, title, remark, vehicle_id
+				FROM onboard_packages_history
+				WHERE vehicle_id = ? AND archived_at = ?`,
+				wrongVehicleId, packArchivedAt.Time); err != nil {
+				slog.Error(fmt.Sprintf("Restore onboard_packages error: %v", err))
+				return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to restore onboard packages", Adv: "none"}
+			}
+
+			// 4e. Restore onboard_packages_media via parent package_id values
+			if _, err = tx.ExecContext(ctx, `
+				INSERT INTO onboard_packages_media
+				    (media_id, media_type, media_link, package_id)
+				SELECT media_id, media_type, media_link, package_id
+				FROM onboard_packages_media_history
+				WHERE package_id IN (
+				    SELECT package_id FROM onboard_packages_history
+				    WHERE vehicle_id = ? AND archived_at = ?
+				)`, wrongVehicleId, packArchivedAt.Time); err != nil {
+				slog.Error(fmt.Sprintf("Restore onboard_packages_media error: %v", err))
+				return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to restore onboard package media", Adv: "none"}
+			}
+
+			// Purge the restored rows from their history tables
+			if _, err = tx.ExecContext(ctx, `
+				DELETE FROM onboard_packages_media_history
+				WHERE package_id IN (
+				    SELECT package_id FROM onboard_packages_history
+				    WHERE vehicle_id = ? AND archived_at = ?
+				)`, wrongVehicleId, packArchivedAt.Time); err != nil {
+				slog.Error(fmt.Sprintf("Purge onboard_packages_media_history error: %v", err))
+				return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to purge onboard package media history", Adv: "none"}
+			}
+			if _, err = tx.ExecContext(ctx,
+				"DELETE FROM onboard_packages_history WHERE vehicle_id = ? AND archived_at = ?",
+				wrongVehicleId, packArchivedAt.Time); err != nil {
+				slog.Error(fmt.Sprintf("Purge onboard_packages_history error: %v", err))
+				return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to purge onboard packages history", Adv: "none"}
+			}
+		}
+
+		// 4f. Restore inspection_remarks
+		var rmkArchivedAt sql.NullTime
+		if err = tx.QueryRowContext(ctx,
+			"SELECT MAX(archived_at) FROM inspection_remarks_history WHERE vehicle_id = ?",
+			wrongVehicleId).Scan(&rmkArchivedAt); err != nil {
+			slog.Error(fmt.Sprintf("History check (remarks) error: %v", err))
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to check remarks history", Adv: "none"}
+		}
+		if rmkArchivedAt.Valid {
+			if _, err = tx.ExecContext(ctx, `
+				INSERT INTO inspection_remarks
+				    (remark_id, vehicle_id, user_id, remark, remark_type, image_link, remark_time)
+				SELECT remark_id, vehicle_id, user_id, remark, remark_type, image_link, remark_time
+				FROM inspection_remarks_history
+				WHERE vehicle_id = ? AND archived_at = ?`,
+				wrongVehicleId, rmkArchivedAt.Time); err != nil {
+				slog.Error(fmt.Sprintf("Restore inspection_remarks error: %v", err))
+				return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to restore inspection remarks", Adv: "none"}
+			}
+			if _, err = tx.ExecContext(ctx,
+				"DELETE FROM inspection_remarks_history WHERE vehicle_id = ? AND archived_at = ?",
+				wrongVehicleId, rmkArchivedAt.Time); err != nil {
+				slog.Error(fmt.Sprintf("Purge inspection_remarks_history error: %v", err))
+				return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to purge remarks history", Adv: "none"}
+			}
+		}
+
+		// 4g. Restore vehicle_galllery (preserving the intentional triple-l spelling)
+		var galleryArchivedAt sql.NullTime
+		if err = tx.QueryRowContext(ctx,
+			"SELECT MAX(archived_at) FROM vehicle_galllery_history WHERE vehicle_id = ?",
+			wrongVehicleId).Scan(&galleryArchivedAt); err != nil {
+			slog.Error(fmt.Sprintf("History check (gallery) error: %v", err))
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to check gallery history", Adv: "none"}
+		}
+		if galleryArchivedAt.Valid {
+			if _, err = tx.ExecContext(ctx, `
+				INSERT INTO vehicle_galllery
+				    (media_id, media_link, media_type, remark, vehicle_id, status)
+				SELECT media_id, media_link, media_type, remark, vehicle_id, status
+				FROM vehicle_galllery_history
+				WHERE vehicle_id = ? AND archived_at = ?`,
+				wrongVehicleId, galleryArchivedAt.Time); err != nil {
+				slog.Error(fmt.Sprintf("Restore vehicle_galllery error: %v", err))
+				return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to restore vehicle gallery", Adv: "none"}
+			}
+			if _, err = tx.ExecContext(ctx,
+				"DELETE FROM vehicle_galllery_history WHERE vehicle_id = ? AND archived_at = ?",
+				wrongVehicleId, galleryArchivedAt.Time); err != nil {
+				slog.Error(fmt.Sprintf("Purge vehicle_galllery_history error: %v", err))
+				return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to purge gallery history", Adv: "none"}
+			}
+		}
+
+		// Purge the tally history row last (it is the anchor for the archive batch).
+		if _, err = tx.ExecContext(ctx,
+			"DELETE FROM vehicles_talling_history WHERE vehicle_id = ? AND archived_at = ?",
+			wrongVehicleId, tallyArchivedAt.Time); err != nil {
+			slog.Error(fmt.Sprintf("Purge vehicles_talling_history error: %v", err))
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to purge tally history", Adv: "none"}
+		}
+
+		// ── Step 5a: wrongVehicleId now has its original data restored ─────────
+		if _, err = tx.ExecContext(ctx,
+			"UPDATE manifest_vehicles SET inspection_status = 'yes', tallied_status = 'yes' WHERE vehicle_id = ?",
+			wrongVehicleId); err != nil {
+			slog.Error(fmt.Sprintf("Status update (wrong vehicle restore) error: %v", err))
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to restore wrong vehicle status", Adv: "none"}
+		}
+	} else {
+		// ── Step 5b: wrongVehicleId was never legitimately inspected ──────────
+		// Reset its manifest status so it re-appears as pending in all dashboards.
+		if _, err = tx.ExecContext(ctx, `
+			UPDATE manifest_vehicles SET
+			    inspection_status = 'no',
+			    tallied_status    = 'no',
+			    ispection_time    = '1000-01-01 00:00:00',
+			    tallied_time      = '1000-01-01 00:00:00'
+			WHERE vehicle_id = ?`, wrongVehicleId); err != nil {
+			slog.Error(fmt.Sprintf("Status reset (wrong vehicle) error: %v", err))
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to reset wrong vehicle status", Adv: "none"}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		slog.Error(fmt.Sprintf("Transaction commit error: %v", err))
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to commit changes. Please try again.", Adv: "none"}
+	}
+	committed = true
+
+	return &constants.AnswerState{
+		State: constants.SuccessState,
+		Data:  "Vehicle identification corrected successfully.",
+		Adv:   "none",
+	}
+}
+
+// TransferVehicleData moves inspection data from sourceVehicleId to targetVehicleId.
+//
+// dataSource controls which set of records targetVehicleId receives:
+//
+//   - "active":  the live active-table rows of sourceVehicleId are re-attributed to
+//     targetVehicleId. The source's active records are gone after this call.
+//     All source history is also purged and source is reset to uninspected.
+//
+//   - "history": the most-recent archived batch for sourceVehicleId is restored into
+//     the active tables under targetVehicleId. The source keeps its own active records
+//     intact. All source history is purged after the restore.
+//
+// targetVehicleId must have no existing inspection records in the active tables.
+func TransferVehicleData(sourceVehicleId, targetVehicleId, dataSource string) *constants.AnswerState {
+	if sourceVehicleId == "" || targetVehicleId == "" || sourceVehicleId == targetVehicleId {
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Invalid vehicle IDs: both must be non-empty and distinct", Adv: "none"}
+	}
+	if dataSource != "active" && dataSource != "history" {
+		return &constants.AnswerState{State: constants.ErrorState, Data: `dataSource must be "active" or "history"`, Adv: "none"}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	db, er := gendb.InitDb()
+	if er != nil {
+		slog.Error(fmt.Sprintf("Database connection error: %s", er.Error()))
+		return &constants.AnswerState{State: constants.ErrorState, Data: er.Error(), Adv: "none"}
+	}
+	defer db.Close()
+
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		slog.Error(fmt.Sprintf("Transaction start error: %s", err.Error()))
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to start transaction", Adv: "none"}
+	}
+
+	var committed bool
+	defer func() {
+		if !committed {
+			if err := tx.Rollback(); err != nil && err != sql.ErrTxDone {
+				slog.Error(fmt.Sprintf("Failed to rollback transaction: %s", err.Error()))
+			}
+		}
+	}()
+
+	switch dataSource {
+
+	// ── "active": re-attribute all live rows to the target vehicle ─────────────
+	// inspection_image and onboard_packages_media have no vehicle_id column; they
+	// follow automatically because their parent inspection_id / package_id keys are
+	// unchanged by the UPDATE.
+	case "active":
+		for _, tbl := range [5]string{
+			"vehicles_talling",
+			"vehicles_inspection",
+			"onboard_packages",
+			"inspection_remarks",
+			"vehicle_galllery",
+		} {
+			if _, err = tx.ExecContext(ctx,
+				"UPDATE "+tbl+" SET vehicle_id = ? WHERE vehicle_id = ?",
+				targetVehicleId, sourceVehicleId); err != nil {
+				slog.Error("Transfer active %s error: %v", tbl, err)
+				return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to transfer active records", Adv: "none"}
+			}
+		}
+
+	// ── "history": restore the most-recent archive batch to the target vehicle ─
+	// vehicle_id is substituted with targetVehicleId in every INSERT … SELECT so
+	// the restored rows are owned by the correct vehicle from the start.
+	// inspection_image and onboard_packages_media carry no vehicle_id, so they are
+	// copied verbatim using the same inspection_id / package_id values.
+	case "history":
+		var tallyAt sql.NullTime
+		if err = tx.QueryRowContext(ctx,
+			"SELECT MAX(archived_at) FROM vehicles_talling_history WHERE vehicle_id = ?",
+			sourceVehicleId).Scan(&tallyAt); err != nil {
+			slog.Error(fmt.Sprintf("History read (tally) error: %s", err.Error()))
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to read tally history", Adv: "none"}
+		}
+		if !tallyAt.Valid {
+			return &constants.AnswerState{State: constants.ErrorState, Data: "No history found for source vehicle", Adv: "none"}
+		}
+
+		if _, err = tx.ExecContext(ctx, `
+			INSERT INTO vehicles_talling
+			    (tally_id, vehicle_id, manifest_id, maker_id, body_id, image_link, deck_number, number_of_keys, key_type, tallied_time)
+			SELECT tally_id, ?, manifest_id, maker_id, body_id, image_link, deck_number, number_of_keys, key_type, tallied_time
+			FROM vehicles_talling_history
+			WHERE vehicle_id = ? AND archived_at = ?`,
+			targetVehicleId, sourceVehicleId, tallyAt.Time); err != nil {
+			slog.Error(fmt.Sprintf("Restore tally to target error: %s", err.Error()))
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to restore tally record", Adv: "none"}
+		}
+
+		var inspAt sql.NullTime
+		if err = tx.QueryRowContext(ctx,
+			"SELECT MAX(archived_at) FROM vehicles_inspection_history WHERE vehicle_id = ?",
+			sourceVehicleId).Scan(&inspAt); err != nil {
+			slog.Error(fmt.Sprintf("History read (inspection) error: %s", err.Error()))
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to read inspection history", Adv: "none"}
+		}
+		if inspAt.Valid {
+			if _, err = tx.ExecContext(ctx, `
+				INSERT INTO vehicles_inspection
+				    (inspection_id, vehicle_id, check_id, user_id, status, check_time)
+				SELECT inspection_id, ?, check_id, user_id, status, check_time
+				FROM vehicles_inspection_history
+				WHERE vehicle_id = ? AND archived_at = ?`,
+				targetVehicleId, sourceVehicleId, inspAt.Time); err != nil {
+				slog.Error(fmt.Sprintf("Restore inspection to target error: %s", err.Error()))
+				return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to restore inspection records", Adv: "none"}
+			}
+			if _, err = tx.ExecContext(ctx, `
+				INSERT INTO inspection_image
+				    (image_id, image_link, inspection_id, creation_time)
+				SELECT image_id, image_link, inspection_id, creation_time
+				FROM inspection_image_history
+				WHERE inspection_id IN (
+				    SELECT inspection_id FROM vehicles_inspection_history
+				    WHERE vehicle_id = ? AND archived_at = ?
+				)`, sourceVehicleId, inspAt.Time); err != nil {
+				slog.Error(fmt.Sprintf("Restore inspection_image to target error: %s", err.Error()))
+				return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to restore inspection images", Adv: "none"}
+			}
+		}
+
+		var packAt sql.NullTime
+		if err = tx.QueryRowContext(ctx,
+			"SELECT MAX(archived_at) FROM onboard_packages_history WHERE vehicle_id = ?",
+			sourceVehicleId).Scan(&packAt); err != nil {
+			slog.Error(fmt.Sprintf("History read (packages) error: %s", err.Error()))
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to read package history", Adv: "none"}
+		}
+		if packAt.Valid {
+			if _, err = tx.ExecContext(ctx, `
+				INSERT INTO onboard_packages
+				    (package_id, title, remark, vehicle_id)
+				SELECT package_id, title, remark, ?
+				FROM onboard_packages_history
+				WHERE vehicle_id = ? AND archived_at = ?`,
+				targetVehicleId, sourceVehicleId, packAt.Time); err != nil {
+				slog.Error(fmt.Sprintf("Restore packages to target error: %s", err.Error()))
+				return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to restore onboard packages", Adv: "none"}
+			}
+			if _, err = tx.ExecContext(ctx, `
+				INSERT INTO onboard_packages_media
+				    (media_id, media_type, media_link, package_id)
+				SELECT media_id, media_type, media_link, package_id
+				FROM onboard_packages_media_history
+				WHERE package_id IN (
+				    SELECT package_id FROM onboard_packages_history
+				    WHERE vehicle_id = ? AND archived_at = ?
+				)`, sourceVehicleId, packAt.Time); err != nil {
+				slog.Error(fmt.Sprintf("Restore package media to target error: %s", err.Error()))
+				return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to restore onboard package media", Adv: "none"}
+			}
+		}
+
+		var rmkAt sql.NullTime
+		if err = tx.QueryRowContext(ctx,
+			"SELECT MAX(archived_at) FROM inspection_remarks_history WHERE vehicle_id = ?",
+			sourceVehicleId).Scan(&rmkAt); err != nil {
+			slog.Error(fmt.Sprintf("History read (remarks) error: %s", err.Error()))
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to read remarks history", Adv: "none"}
+		}
+		if rmkAt.Valid {
+			if _, err = tx.ExecContext(ctx, `
+				INSERT INTO inspection_remarks
+				    (remark_id, vehicle_id, user_id, remark, remark_type, image_link, remark_time)
+				SELECT remark_id, ?, user_id, remark, remark_type, image_link, remark_time
+				FROM inspection_remarks_history
+				WHERE vehicle_id = ? AND archived_at = ?`,
+				targetVehicleId, sourceVehicleId, rmkAt.Time); err != nil {
+				slog.Error(fmt.Sprintf("Restore remarks to target error: %s", err.Error()))
+				return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to restore inspection remarks", Adv: "none"}
+			}
+		}
+
+		var gallAt sql.NullTime
+		if err = tx.QueryRowContext(ctx,
+			"SELECT MAX(archived_at) FROM vehicle_galllery_history WHERE vehicle_id = ?",
+			sourceVehicleId).Scan(&gallAt); err != nil {
+			slog.Error(fmt.Sprintf("History read (gallery) error: %s", err.Error()))
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to read gallery history", Adv: "none"}
+		}
+		if gallAt.Valid {
+			if _, err = tx.ExecContext(ctx, `
+				INSERT INTO vehicle_galllery
+				    (media_id, media_link, media_type, remark, vehicle_id, status)
+				SELECT media_id, media_link, media_type, remark, ?, status
+				FROM vehicle_galllery_history
+				WHERE vehicle_id = ? AND archived_at = ?`,
+				targetVehicleId, sourceVehicleId, gallAt.Time); err != nil {
+				slog.Error(fmt.Sprintf("Restore gallery to target error: %s", err.Error()))
+				return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to restore vehicle gallery", Adv: "none"}
+			}
+		}
+	}
+
+	// Mark targetVehicleId as fully inspected / tallied regardless of which source was used.
+	if _, err = tx.ExecContext(ctx,
+		"UPDATE manifest_vehicles SET inspection_status = 'yes', tallied_status = 'yes' WHERE vehicle_id = ?",
+		targetVehicleId); err != nil {
+		slog.Error(fmt.Sprintf("Status update (target) error: %s", err.Error()))
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to update target vehicle status", Adv: "none"}
+	}
+
+	// ── Purge ALL history for sourceVehicleId ─────────────────────────────────
+	// Child tables first to respect FK order.
+	if _, err = tx.ExecContext(ctx, `
+		DELETE FROM inspection_image_history
+		WHERE inspection_id IN (
+		    SELECT inspection_id FROM vehicles_inspection_history WHERE vehicle_id = ?
+		)`, sourceVehicleId); err != nil {
+		slog.Error(fmt.Sprintf("Purge inspection_image_history error: %s", err.Error()))
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to purge inspection image history", Adv: "none"}
+	}
+	if _, err = tx.ExecContext(ctx, `
+		DELETE FROM onboard_packages_media_history
+		WHERE package_id IN (
+		    SELECT package_id FROM onboard_packages_history WHERE vehicle_id = ?
+		)`, sourceVehicleId); err != nil {
+		slog.Error(fmt.Sprintf("Purge onboard_packages_media_history error: %s", err.Error()))
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to purge onboard package media history", Adv: "none"}
+	}
+	for _, tbl := range [5]string{
+		"vehicles_inspection_history",
+		"onboard_packages_history",
+		"inspection_remarks_history",
+		"vehicle_galllery_history",
+		"vehicles_talling_history",
+	} {
+		if _, err = tx.ExecContext(ctx, "DELETE FROM "+tbl+" WHERE vehicle_id = ?", sourceVehicleId); err != nil {
+			slog.Error("Purge %s error: %s", tbl, err.Error())
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to purge history records", Adv: "none"}
+		}
+	}
+
+	// When active data was transferred the source has no records left at all — reset
+	// its manifest status. When history was transferred the source still has its own
+	// active inspection intact, so leave its status unchanged.
+	if dataSource == "active" {
+		if _, err = tx.ExecContext(ctx, `
+			UPDATE manifest_vehicles SET
+			    inspection_status = 'no',
+			    tallied_status    = 'no',
+			    ispection_time    = '1000-01-01 00:00:00',
+			    tallied_time      = '1000-01-01 00:00:00'
+			WHERE vehicle_id = ?`, sourceVehicleId); err != nil {
+			slog.Error(fmt.Sprintf("Status reset (source) error: %s", err.Error()))
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to reset source vehicle status", Adv: "none"}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		slog.Error(fmt.Sprintf("Transaction commit error: %s", err.Error()))
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to commit changes. Please try again.", Adv: "none"}
+	}
+	committed = true
+
+	return &constants.AnswerState{
+		State: constants.SuccessState,
+		Data:  "Vehicle data transferred successfully.",
 		Adv:   "none",
 	}
 }

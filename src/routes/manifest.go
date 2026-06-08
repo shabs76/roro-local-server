@@ -29,6 +29,8 @@ func SetupManifestRoutes(router *gin.Engine) {
 		{
 			veh.POST("/add/single/vehicle", controlers.AddSingleVehicleToManifest)
 			veh.GET("/list/local/:manifestId", controlers.GetVehicleListOfManifest)
+			veh.GET("/list/with/multiple/inspections/:manifestId", controlers.GetVehicleWithMultipleInspections)
+			veh.GET("/multiple/inspection/details/:vehicleId", controlers.GetVehicleInspectionTallyTimeline)
 			veh.GET("/list/inspection/check/:manifestId", controlers.GetVehicleShortInfo) // this is used to check if the vehicle is inspected or not in the manifest list page
 		}
 		// package routes
@@ -44,6 +46,9 @@ func SetupManifestRoutes(router *gin.Engine) {
 		{
 			ins.POST("/save/vehicle/inspection", controlers.SaveVehicleInspectionDetails)
 			ins.POST("/save/package/inspection", controlers.SavePackageInspectionDetails)
+			ins.POST("/save/remarks/only", controlers.SaveVehicleRemarksOnly)
+			// update
+			ins.PUT("/swap/vehicle/inspection", controlers.SaveTransferVehicleData) // not tested yet
 			// data
 			ins.GET("/get/vehicle/inspection/:vehicleId", controlers.GetVehicleInspectionsDetails)
 			ins.GET("/get/package/inspection/:packageId", controlers.GetInspectedPackageDetails)

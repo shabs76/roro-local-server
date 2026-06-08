@@ -78,3 +78,8 @@ type PackageExtraMediaRequest struct {
 	MediaType string `json:"mediaType" binding:"required" oneof:"image,video,pdf"`
 	Remark    string `json:"remark" binding:"required"`
 }
+
+type VehicleRemarksOnlyRequest struct {
+	VehicleId string              `json:"vehicleId" binding:"required"`
+	Remarks   []RemarkSaveRequest `json:"remarks" binding:"required,min=1"`
+}

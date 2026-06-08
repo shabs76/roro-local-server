@@ -261,6 +261,7 @@ type TallyDetails struct {
 type TallyMoreDetails struct {
 	TallyId      string `json:"tallyId" binding:"required"`
 	VehicleId    string `json:"vehicleId" binding:"required"`
+	ManifestId   string `json:"manifestId" binding:"required"`
 	MakerId      string `json:"makerId" binding:"required"`
 	UserId       string `json:"userId" binding:"required"`
 	BodyId       string `json:"bodyId" binding:"required"`

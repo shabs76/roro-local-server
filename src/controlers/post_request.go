@@ -55,6 +55,118 @@ func SaveVehicleInspectionDetails(c *gin.Context) {
 
 }
 
+func SaveFixMistakenVehicleIdentification(c *gin.Context) {
+	userd, exist := c.Get("user")
+	if !exist {
+		c.JSON(http.StatusInternalServerError, gin.H{"state": constants.ErrorState, "data": "Failed to obtain security details"})
+		return
+	}
+
+	user, ok := userd.(users.UserData)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"state": constants.ErrorState, "data": "Failed to obtain security details #2"})
+		return
+	}
+
+	if user.RoleNumber > 300 {
+		c.JSON(http.StatusOK, gin.H{"state": constants.ErrorState, "data": "Sorry, you have no permission to perform this action"})
+		return
+	}
+
+	var req struct {
+		WrongVehicleId   string `json:"wrongVehicleId" binding:"required"`
+		CorrectVehicleId string `json:"correctVehicleId" binding:"required"`
+	}
+
+	if er := c.ShouldBindJSON(&req); er != nil {
+		slog.Error(er.Error())
+		c.JSON(http.StatusBadRequest, gin.H{"state": constants.ErrorState, "data": "Invalid data was sent"})
+		return
+	}
+
+	st := manifestdataservices.FixMistakenVehicleIdentification(req.WrongVehicleId, req.CorrectVehicleId)
+	if st.State != constants.SuccessState {
+		c.JSON(http.StatusInternalServerError, st)
+		return
+	}
+
+	c.JSON(http.StatusOK, st)
+}
+
+func SaveTransferVehicleData(c *gin.Context) {
+	userd, exist := c.Get("user")
+	if !exist {
+		c.JSON(http.StatusInternalServerError, gin.H{"state": constants.ErrorState, "data": "Failed to obtain security details"})
+		return
+	}
+
+	user, ok := userd.(users.UserData)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"state": constants.ErrorState, "data": "Failed to obtain security details #2"})
+		return
+	}
+
+	if user.RoleNumber > 300 {
+		c.JSON(http.StatusOK, gin.H{"state": constants.ErrorState, "data": "Sorry, you have no permission to perform this action"})
+		return
+	}
+
+	var req struct {
+		SourceVehicleId string `json:"sourceVehicleId" binding:"required"`
+		TargetVehicleId string `json:"targetVehicleId" binding:"required"`
+		DataSource      string `json:"dataSource" binding:"required,oneof=active history"`
+	}
+
+	if er := c.ShouldBindJSON(&req); er != nil {
+		slog.Error(er.Error())
+		c.JSON(http.StatusBadRequest, gin.H{"state": constants.ErrorState, "data": "Invalid data was sent"})
+		return
+	}
+
+	st := manifestdataservices.TransferVehicleData(req.SourceVehicleId, req.TargetVehicleId, req.DataSource)
+	if st.State != constants.SuccessState {
+		c.JSON(http.StatusInternalServerError, st)
+		return
+	}
+
+	c.JSON(http.StatusOK, st)
+}
+
+func SaveVehicleRemarksOnly(c *gin.Context) {
+	userd, exist := c.Get("user")
+	if !exist {
+		c.JSON(http.StatusInternalServerError, gin.H{"state": constants.ErrorState, "data": "Failed to obtain security details"})
+		return
+	}
+
+	user, ok := userd.(users.UserData)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"state": constants.ErrorState, "data": "Failed to obtain security details #2"})
+		return
+	}
+
+	if user.RoleNumber > 700 {
+		c.JSON(http.StatusOK, gin.H{"state": constants.ErrorState, "data": "Sorry, you have no permission to perform this action"})
+		return
+	}
+
+	var req manifest.VehicleRemarksOnlyRequest
+
+	if er := c.ShouldBindJSON(&req); er != nil {
+		slog.Error(er.Error())
+		c.JSON(http.StatusBadRequest, gin.H{"state": constants.ErrorState, "data": "Invalid data was sent"})
+		return
+	}
+
+	st := manifestdataservices.InsertVehicleRemarksOnly(req, user.UserID)
+	if st.State != constants.SuccessState {
+		c.JSON(http.StatusInternalServerError, st)
+		return
+	}
+
+	c.JSON(http.StatusOK, st)
+}
+
 func AddSingleVehicleToManifest(c *gin.Context) {
 	// user details from context
 	userd, exist := c.Get("user")

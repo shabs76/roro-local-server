@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	apiservices "github.com/shabs76/roro-local-server/api_services"
@@ -1969,4 +1970,181 @@ func GetInspectedPackageDetails(c *gin.Context) {
 		"state": constants.SuccessState,
 		"data":  packageDetails[0],
 	})
+}
+
+type VehicleInspectionTallyTimelineRes struct {
+	VehicleId      string                        `json:"vehicleId" binding:"required"`
+	ManifestId     string                        `json:"manifestId" binding:"required"`
+	ActiveData     VehicleInspectionDetailsRes   `json:"activeData"`
+	HistoricalData []VehicleInspectionDetailsRes `json:"historicalData"`
+}
+
+func GetVehicleWithMultipleInspections(c *gin.Context) {
+	manifestId := c.Param("manifestId")
+	if manifestId == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"state": constants.ErrorState, "data": "Manifest ID is required"})
+		return
+	}
+
+	page := c.DefaultQuery("page", "1")
+	ipg, err := strconv.Atoi(page)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"state": constants.ErrorState, "data": "Failed to obtain page number"})
+		return
+	}
+
+	limit := 250
+	if l := c.Query("limit"); l != "" {
+		if val, err := strconv.Atoi(l); err == nil && val > 0 {
+			limit = val
+		}
+	}
+
+	subQr := " `manifest_id` = ? AND `vehicle_id` IN (SELECT DISTINCT vehicle_id FROM `vehicles_talling_history`) "
+	vals := []any{manifestId}
+
+	if searchQuery := c.Query("query"); searchQuery != "" {
+		subQr += " AND ( `chasis_number` LIKE ? OR `model` LIKE ? OR `description` LIKE ? OR `weight` LIKE ? OR `bl_no` LIKE ? )"
+		s := "%" + searchQuery + "%"
+		vals = append(vals, s, s, s, s, s)
+	}
+
+	qr := "SELECT COUNT(vehicle_id) AS numbers FROM `manifest_vehicles` WHERE " + subQr
+	stx, rez := gendb.PagenationSelect(qr, ipg, limit, vals)
+	if stx.State != constants.SuccessState {
+		c.JSON(http.StatusInternalServerError, gin.H{"state": constants.ErrorState, "data": "Failed to obtain pagination limit"})
+		return
+	}
+	if rez.State == "end" {
+		c.JSON(http.StatusOK, gin.H{"state": constants.SuccessState, "data": []any{}, "adv": rez.ResNum, "per": limit})
+		return
+	}
+
+	st, vehicles := manifestdataservices.SelectVehicleInfo(subQr+" ORDER BY `vehicle_id` DESC "+rez.Limit, vals)
+	if st.State != constants.SuccessState {
+		slog.Error(st.Data)
+		c.JSON(http.StatusInternalServerError, gin.H{"state": constants.ErrorState, "data": "Failed to fetch vehicles for manifest"})
+		return
+	}
+
+	if len(vehicles) == 0 {
+		c.JSON(http.StatusOK, gin.H{"state": constants.SuccessState, "data": []any{}, "adv": rez.ResNum, "per": limit})
+		return
+	}
+
+	vhShow := enrichVehicleDetails(vehicles)
+	c.JSON(http.StatusOK, gin.H{"state": constants.SuccessState, "data": vhShow, "adv": rez.ResNum, "per": limit})
+}
+
+func GetVehicleInspectionTallyTimeline(c *gin.Context) {
+	vehicleId := c.Param("vehicleId")
+	if vehicleId == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"state": constants.ErrorState, "data": "Vehicle ID is required"})
+		return
+	}
+
+	st, vehicles := manifestdataservices.SelectVehicleInfo(" `vehicle_id` = ? ", []any{vehicleId})
+	if st.State != constants.SuccessState {
+		slog.Error(st.Data)
+		c.JSON(http.StatusInternalServerError, gin.H{"state": constants.ErrorState, "data": "Failed to fetch vehicle details"})
+		return
+	}
+	if len(vehicles) == 0 {
+		c.JSON(http.StatusOK, gin.H{"state": constants.ErrorState, "data": []any{}})
+		return
+	}
+
+	stx, timeline := buildVehicleInspectionTallyTimeline(vehicles[0].VehicleId, vehicles[0].ManifestId)
+	if stx.State != constants.SuccessState {
+		slog.Error(stx.Data)
+		c.JSON(http.StatusInternalServerError, gin.H{"state": constants.ErrorState, "data": stx.Data})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"state": constants.SuccessState, "data": timeline})
+}
+
+func buildVehicleInspectionTallyTimeline(vehicleId, manifestId string) (*constants.AnswerState, VehicleInspectionTallyTimelineRes) {
+	st, vehicleRows := manifestdataservices.SelectVehicleAndTallyDetails(" manifest_vehicles.vehicle_id = ? ", []any{vehicleId})
+	if st.State != constants.SuccessState {
+		return st, VehicleInspectionTallyTimelineRes{}
+	}
+	if len(vehicleRows) == 0 {
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Vehicle not found", Adv: "none"}, VehicleInspectionTallyTimelineRes{}
+	}
+
+	std, discharge := manifestdataservices.SelectDischargeDetails(" `vehicle_id` = ? ", []any{vehicleId})
+	if std.State != constants.SuccessState {
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to fetch vehicle discharge details", Adv: "none"}, VehicleInspectionTallyTimelineRes{}
+	}
+
+	activeDetails, stActive := buildInspectionDetailsFromTimeline(vehicleId, nil, vehicleRows[0], discharge)
+	if stActive.State != constants.SuccessState {
+		return stActive, VehicleInspectionTallyTimelineRes{}
+	}
+
+	sth, historyTimes := manifestdataservices.SelectVehicleHistoryBatchTimes(vehicleId)
+	if sth.State != constants.SuccessState {
+		return sth, VehicleInspectionTallyTimelineRes{}
+	}
+
+	historicalDetails := make([]VehicleInspectionDetailsRes, 0, len(historyTimes))
+	for i := range historyTimes {
+		det, stBatch := buildInspectionDetailsFromTimeline(vehicleId, &historyTimes[i], vehicleRows[0], discharge)
+		if stBatch.State != constants.SuccessState {
+			return stBatch, VehicleInspectionTallyTimelineRes{}
+		}
+		historicalDetails = append(historicalDetails, det)
+	}
+
+	return &constants.AnswerState{State: constants.SuccessState, Data: "success", Adv: "none"}, VehicleInspectionTallyTimelineRes{
+		VehicleId:      vehicleId,
+		ManifestId:     manifestId,
+		ActiveData:     activeDetails,
+		HistoricalData: historicalDetails,
+	}
+}
+
+func buildInspectionDetailsFromTimeline(vehicleId string, archivedAt *time.Time, vehicleDets manifest.VehiclesDetailsAndTally, discharge []manifest.VehicleDischargeDetails) (VehicleInspectionDetailsRes, *constants.AnswerState) {
+	sti, inspections := manifestdataservices.SelectVehicleTimelineInspections(vehicleId, archivedAt)
+	if sti.State != constants.SuccessState {
+		return VehicleInspectionDetailsRes{}, sti
+	}
+
+	str, remarks := manifestdataservices.SelectVehicleTimelineRemarks(vehicleId, archivedAt)
+	if str.State != constants.SuccessState {
+		return VehicleInspectionDetailsRes{}, str
+	}
+
+	stp, packages := manifestdataservices.SelectVehicleTimelinePackages(vehicleId, archivedAt)
+	if stp.State != constants.SuccessState {
+		return VehicleInspectionDetailsRes{}, stp
+	}
+
+	stm, media := manifestdataservices.SelectVehicleTimelineMedia(vehicleId, archivedAt)
+	if stm.State != constants.SuccessState {
+		return VehicleInspectionDetailsRes{}, stm
+	}
+
+	userId := vehicleDets.UserId
+	if len(inspections) > 0 && inspections[0].UserId != "" {
+		userId = inspections[0].UserId
+	}
+
+	var userDets users.UserData
+	stu, userList := usersdataservices.SelectUserDetailsWithRolesPass(" `user_id` = ? ", []any{userId})
+	if stu.State == constants.SuccessState && len(userList) > 0 {
+		userDets = userList[0]
+		userDets.Password = ""
+	}
+
+	return VehicleInspectionDetailsRes{
+		VehicleDets:   vehicleDets,
+		Inspections:   inspections,
+		Remarks:       remarks,
+		DischargeInfo: discharge,
+		UserDetails:   userDets,
+		Media:         media,
+		Packages:      packages,
+	}, &constants.AnswerState{State: constants.SuccessState, Data: "success", Adv: "none"}
 }

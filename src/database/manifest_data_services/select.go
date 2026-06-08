@@ -2,7 +2,9 @@ package manifestdataservices
 
 import (
 	"database/sql"
+	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/shabs76/roro-local-server/constants"
 	"github.com/shabs76/roro-local-server/constants/modules/manifest"
@@ -363,6 +365,266 @@ func SelectVehicleInfo(subQuery string, vals []any) (*constants.AnswerState, []m
 		Data:  "success",
 		Adv:   "none",
 	}, rows
+}
+
+func SelectVehicleHistoryBatchTimes(vehicleId string) (*constants.AnswerState, []time.Time) {
+	qr := "SELECT DISTINCT archived_at FROM vehicles_talling_history WHERE vehicle_id = ? ORDER BY archived_at DESC"
+	st, rows := gendb.SelectGeneral(qr, []any{vehicleId})
+	if st.State != constants.SuccessState {
+		return st, nil
+	}
+	defer rows.Close()
+
+	times := []time.Time{}
+	for rows.Next() {
+		var at string
+		if err := rows.Scan(&at); err != nil {
+			slog.Error(err.Error())
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to bind history batch times", Adv: "none"}, nil
+		}
+		parsedTime, err := time.Parse("2006-01-02 15:04:05", at)
+		if err != nil {
+			slog.Error(err.Error())
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to parse history batch times", Adv: "none"}, nil
+		}
+		times = append(times, parsedTime)
+	}
+
+	if err := rows.Err(); err != nil {
+		slog.Error(err.Error())
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to iterate history batch times", Adv: "none"}, nil
+	}
+
+	return &constants.AnswerState{State: constants.SuccessState, Data: "success", Adv: "none"}, times
+}
+
+func SelectVehicleTimelineTally(vehicleId string, archivedAt *time.Time) (*constants.AnswerState, []manifest.TallyMoreDetails) {
+	table := "vehicles_talling"
+	vals := []any{vehicleId}
+	where := "t.vehicle_id = ?"
+	if archivedAt != nil {
+		table = "vehicles_talling_history"
+		where = "t.vehicle_id = ? AND t.archived_at = ?"
+		vals = append(vals, *archivedAt)
+	}
+
+	qr := fmt.Sprintf("SELECT t.tally_id, t.vehicle_id, t.manifest_id, t.maker_id, t.body_id, t.tallied_time, vm.maker_name, vb.body_name, t.image_link, t.deck_number, t.number_of_keys, t.key_type FROM %s t INNER JOIN vehicle_makers vm ON vm.maker_id = t.maker_id INNER JOIN vehicle_bodies vb ON vb.body_id = t.body_id WHERE %s", table, where)
+
+	st, rows := gendb.SelectGeneral(qr, vals)
+	if st.State != constants.SuccessState {
+		return st, nil
+	}
+	defer rows.Close()
+
+	result := []manifest.TallyMoreDetails{}
+	for rows.Next() {
+		var row manifest.TallyMoreDetails
+		if err := rows.Scan(&row.TallyId, &row.VehicleId, &row.ManifestId, &row.MakerId, &row.BodyId, &row.TalliedTime, &row.MakerName, &row.BodyName, &row.VehicleImage, &row.DeckNumber, &row.NumberOfKeys, &row.KeyType); err != nil {
+			slog.Error(err.Error())
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to bind timeline tally data", Adv: "none"}, nil
+		}
+		result = append(result, row)
+	}
+
+	if err := rows.Err(); err != nil {
+		slog.Error(err.Error())
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to iterate timeline tally data", Adv: "none"}, nil
+	}
+
+	return &constants.AnswerState{State: constants.SuccessState, Data: "success", Adv: "none"}, result
+}
+
+func SelectVehicleTimelineInspections(vehicleId string, archivedAt *time.Time) (*constants.AnswerState, []manifest.InspectionDetailsAndImage) {
+	inspectionTable := "vehicles_inspection"
+	imageTable := "inspection_image"
+	vals := []any{vehicleId}
+	where := "vi.vehicle_id = ?"
+	if archivedAt != nil {
+		inspectionTable = "vehicles_inspection_history"
+		imageTable = "inspection_image_history"
+		where = "vi.vehicle_id = ? AND vi.archived_at = ?"
+		vals = append(vals, *archivedAt)
+	}
+
+	qr := fmt.Sprintf("SELECT vi.inspection_id, vi.vehicle_id, vi.check_id, ic.check_name, vi.status, vi.check_time FROM %s vi INNER JOIN inspection_checklist ic ON ic.check_id = vi.check_id WHERE %s", inspectionTable, where)
+
+	st, rows := gendb.SelectGeneral(qr, vals)
+	if st.State != constants.SuccessState {
+		return st, nil
+	}
+	defer rows.Close()
+
+	result := []manifest.InspectionDetailsAndImage{}
+	for rows.Next() {
+		var row manifest.InspectionDetailsAndImage
+		if err := rows.Scan(&row.InspectionId, &row.VehicleId, &row.CheckId, &row.CheckName, &row.Status, &row.Checktime); err != nil {
+			slog.Error(err.Error())
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to bind timeline inspection data", Adv: "none"}, nil
+		}
+
+		imageQr := fmt.Sprintf("SELECT image_link FROM %s WHERE inspection_id = ?", imageTable)
+		imageVals := []any{row.InspectionId}
+		if archivedAt != nil {
+			imageQr += " AND archived_at = ?"
+			imageVals = append(imageVals, *archivedAt)
+		}
+		imageQr += " ORDER BY creation_time DESC LIMIT 1"
+
+		sti, imgRows := gendb.SelectGeneral(imageQr, imageVals)
+		if sti.State != constants.SuccessState {
+			return sti, nil
+		}
+		if imgRows.Next() {
+			if err := imgRows.Scan(&row.Image); err != nil {
+				imgRows.Close()
+				slog.Error(err.Error())
+				return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to bind timeline inspection image", Adv: "none"}, nil
+			}
+		}
+		imgRows.Close()
+
+		result = append(result, row)
+	}
+
+	if err := rows.Err(); err != nil {
+		slog.Error(err.Error())
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to iterate timeline inspection data", Adv: "none"}, nil
+	}
+
+	return &constants.AnswerState{State: constants.SuccessState, Data: "success", Adv: "none"}, result
+}
+
+func SelectVehicleTimelineRemarks(vehicleId string, archivedAt *time.Time) (*constants.AnswerState, []manifest.InspectionRemarksDetails) {
+	table := "inspection_remarks"
+	vals := []any{vehicleId}
+	where := "vehicle_id = ?"
+	if archivedAt != nil {
+		table = "inspection_remarks_history"
+		where = "vehicle_id = ? AND archived_at = ?"
+		vals = append(vals, *archivedAt)
+	}
+
+	qr := fmt.Sprintf("SELECT remark_id, vehicle_id, remark, remark_type, image_link, remark_time FROM %s WHERE %s", table, where)
+	st, rows := gendb.SelectGeneral(qr, vals)
+	if st.State != constants.SuccessState {
+		return st, nil
+	}
+	defer rows.Close()
+
+	result := []manifest.InspectionRemarksDetails{}
+	for rows.Next() {
+		var row manifest.InspectionRemarksDetails
+		if err := rows.Scan(&row.RemarkId, &row.VehicleId, &row.Remark, &row.RemarkType, &row.ImageLink, &row.RemarkTime); err != nil {
+			slog.Error(err.Error())
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to bind timeline remarks data", Adv: "none"}, nil
+		}
+		result = append(result, row)
+	}
+
+	if err := rows.Err(); err != nil {
+		slog.Error(err.Error())
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to iterate timeline remarks data", Adv: "none"}, nil
+	}
+
+	return &constants.AnswerState{State: constants.SuccessState, Data: "success", Adv: "none"}, result
+}
+
+func SelectVehicleTimelinePackages(vehicleId string, archivedAt *time.Time) (*constants.AnswerState, []manifest.OnboardPackageResp) {
+	packageTable := "onboard_packages"
+	mediaTable := "onboard_packages_media"
+	vals := []any{vehicleId}
+	where := "vehicle_id = ?"
+	if archivedAt != nil {
+		packageTable = "onboard_packages_history"
+		mediaTable = "onboard_packages_media_history"
+		where = "vehicle_id = ? AND archived_at = ?"
+		vals = append(vals, *archivedAt)
+	}
+
+	qr := fmt.Sprintf("SELECT package_id, title, remark, vehicle_id FROM %s WHERE %s", packageTable, where)
+	st, rows := gendb.SelectGeneral(qr, vals)
+	if st.State != constants.SuccessState {
+		return st, nil
+	}
+	defer rows.Close()
+
+	result := []manifest.OnboardPackageResp{}
+	for rows.Next() {
+		var row manifest.OnboardPackageResp
+		if err := rows.Scan(&row.PackageId, &row.Title, &row.Remark, &row.VehicleId); err != nil {
+			slog.Error(err.Error())
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to bind timeline package data", Adv: "none"}, nil
+		}
+
+		mediaQr := fmt.Sprintf("SELECT media_id, media_type, media_link, package_id FROM %s WHERE package_id = ?", mediaTable)
+		mediaVals := []any{row.PackageId}
+		if archivedAt != nil {
+			mediaQr += " AND archived_at = ?"
+			mediaVals = append(mediaVals, *archivedAt)
+		}
+
+		stm, mediaRows := gendb.SelectGeneral(mediaQr, mediaVals)
+		if stm.State != constants.SuccessState {
+			return stm, nil
+		}
+
+		mediaList := []manifest.OnBoardPackageMediaResp{}
+		for mediaRows.Next() {
+			var media manifest.OnBoardPackageMediaResp
+			if err := mediaRows.Scan(&media.MediaId, &media.MediaType, &media.MediaLink, &media.PackageId); err != nil {
+				mediaRows.Close()
+				slog.Error(err.Error())
+				return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to bind timeline package media", Adv: "none"}, nil
+			}
+			mediaList = append(mediaList, media)
+		}
+		mediaRows.Close()
+
+		row.Media = mediaList
+		result = append(result, row)
+	}
+
+	if err := rows.Err(); err != nil {
+		slog.Error(err.Error())
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to iterate timeline package data", Adv: "none"}, nil
+	}
+
+	return &constants.AnswerState{State: constants.SuccessState, Data: "success", Adv: "none"}, result
+}
+
+func SelectVehicleTimelineMedia(vehicleId string, archivedAt *time.Time) (*constants.AnswerState, []manifest.VehicleMediaResp) {
+	table := "vehicle_galllery"
+	vals := []any{vehicleId}
+	where := "vehicle_id = ?"
+	if archivedAt != nil {
+		table = "vehicle_galllery_history"
+		where = "vehicle_id = ? AND archived_at = ?"
+		vals = append(vals, *archivedAt)
+	}
+
+	qr := fmt.Sprintf("SELECT media_id, media_link, media_type, remark, vehicle_id, status FROM %s WHERE %s", table, where)
+	st, rows := gendb.SelectGeneral(qr, vals)
+	if st.State != constants.SuccessState {
+		return st, nil
+	}
+	defer rows.Close()
+
+	result := []manifest.VehicleMediaResp{}
+	for rows.Next() {
+		var row manifest.VehicleMediaResp
+		if err := rows.Scan(&row.MediaId, &row.MediaLink, &row.MediaType, &row.Remark, &row.VehicleId, &row.Status); err != nil {
+			slog.Error(err.Error())
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to bind timeline vehicle media", Adv: "none"}, nil
+		}
+		result = append(result, row)
+	}
+
+	if err := rows.Err(); err != nil {
+		slog.Error(err.Error())
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to iterate timeline vehicle media", Adv: "none"}, nil
+	}
+
+	return &constants.AnswerState{State: constants.SuccessState, Data: "success", Adv: "none"}, result
 }
 
 func SelectVehiclesAndInspectionDetails(subQuery string, vals []any) (*constants.AnswerState, []manifest.VehiclesDetailsAndInspection) {
@@ -764,7 +1026,7 @@ func SelectDischargeDetails(subQuery string, vals []any) (*constants.AnswerState
 
 	defer res.Close()
 
-	var rows []manifest.VehicleDischargeDetails
+	rows := []manifest.VehicleDischargeDetails{}
 
 	for res.Next() {
 		var row manifest.VehicleDischargeDetails
