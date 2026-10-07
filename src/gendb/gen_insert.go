@@ -18,8 +18,6 @@ func SaveGeneral(sq string, vals []any) *constants.AnswerState {
 		}
 	}
 
-	defer db.Close()
-
 	stmt, err := db.Prepare(sq)
 
 	if err != nil {

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/shabs76/roro-local-server/constants"
@@ -437,16 +438,22 @@ func SelectVehicleTimelineTally(vehicleId string, archivedAt *time.Time) (*const
 func SelectVehicleTimelineInspections(vehicleId string, archivedAt *time.Time) (*constants.AnswerState, []manifest.InspectionDetailsAndImage) {
 	inspectionTable := "vehicles_inspection"
 	imageTable := "inspection_image"
+	imageMatch := ""
 	vals := []any{vehicleId}
 	where := "vi.vehicle_id = ?"
 	if archivedAt != nil {
 		inspectionTable = "vehicles_inspection_history"
 		imageTable = "inspection_image_history"
+		imageMatch = " AND ii.archived_at = vi.archived_at"
 		where = "vi.vehicle_id = ? AND vi.archived_at = ?"
 		vals = append(vals, *archivedAt)
 	}
 
-	qr := fmt.Sprintf("SELECT vi.inspection_id, vi.vehicle_id, vi.check_id, ic.check_name, vi.status, vi.check_time FROM %s vi INNER JOIN inspection_checklist ic ON ic.check_id = vi.check_id WHERE %s", inspectionTable, where)
+	// The latest image per inspection is read by a correlated subquery so the whole
+	// timeline is one statement instead of one extra query per check.
+	qr := fmt.Sprintf(`SELECT vi.inspection_id, vi.vehicle_id, vi.check_id, ic.check_name, vi.status, vi.check_time,
+		COALESCE((SELECT ii.image_link FROM %s ii WHERE ii.inspection_id = vi.inspection_id%s ORDER BY ii.creation_time DESC LIMIT 1), '')
+		FROM %s vi INNER JOIN inspection_checklist ic ON ic.check_id = vi.check_id WHERE %s`, imageTable, imageMatch, inspectionTable, where)
 
 	st, rows := gendb.SelectGeneral(qr, vals)
 	if st.State != constants.SuccessState {
@@ -457,32 +464,10 @@ func SelectVehicleTimelineInspections(vehicleId string, archivedAt *time.Time) (
 	result := []manifest.InspectionDetailsAndImage{}
 	for rows.Next() {
 		var row manifest.InspectionDetailsAndImage
-		if err := rows.Scan(&row.InspectionId, &row.VehicleId, &row.CheckId, &row.CheckName, &row.Status, &row.Checktime); err != nil {
+		if err := rows.Scan(&row.InspectionId, &row.VehicleId, &row.CheckId, &row.CheckName, &row.Status, &row.Checktime, &row.Image); err != nil {
 			slog.Error(err.Error())
 			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to bind timeline inspection data", Adv: "none"}, nil
 		}
-
-		imageQr := fmt.Sprintf("SELECT image_link FROM %s WHERE inspection_id = ?", imageTable)
-		imageVals := []any{row.InspectionId}
-		if archivedAt != nil {
-			imageQr += " AND archived_at = ?"
-			imageVals = append(imageVals, *archivedAt)
-		}
-		imageQr += " ORDER BY creation_time DESC LIMIT 1"
-
-		sti, imgRows := gendb.SelectGeneral(imageQr, imageVals)
-		if sti.State != constants.SuccessState {
-			return sti, nil
-		}
-		if imgRows.Next() {
-			if err := imgRows.Scan(&row.Image); err != nil {
-				imgRows.Close()
-				slog.Error(err.Error())
-				return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to bind timeline inspection image", Adv: "none"}, nil
-			}
-		}
-		imgRows.Close()
-
 		result = append(result, row)
 	}
 
@@ -530,18 +515,25 @@ func SelectVehicleTimelineRemarks(vehicleId string, archivedAt *time.Time) (*con
 }
 
 func SelectVehicleTimelinePackages(vehicleId string, archivedAt *time.Time) (*constants.AnswerState, []manifest.OnboardPackageResp) {
-	packageTable := "onboard_packages"
-	mediaTable := "onboard_packages_media"
-	vals := []any{vehicleId}
-	where := "vehicle_id = ?"
 	if archivedAt != nil {
-		packageTable = "onboard_packages_history"
-		mediaTable = "onboard_packages_media_history"
-		where = "vehicle_id = ? AND archived_at = ?"
-		vals = append(vals, *archivedAt)
+		return selectPackagesWithMedia(
+			"SELECT package_id, title, remark, vehicle_id, archived_at FROM onboard_packages_history WHERE vehicle_id = ? AND archived_at = ?",
+			"onboard_packages_media_history", " AND m.archived_at = p.archived_at",
+			[]any{vehicleId, *archivedAt}, true)
 	}
+	return selectPackagesWithMedia(
+		"SELECT package_id, title, remark, vehicle_id FROM onboard_packages WHERE vehicle_id = ?",
+		"onboard_packages_media", "", []any{vehicleId}, true)
+}
 
-	qr := fmt.Sprintf("SELECT package_id, title, remark, vehicle_id FROM %s WHERE %s", packageTable, where)
+// selectPackagesWithMedia reads onboard packages and their media in one statement.
+// packageQuery selects the packages (derived table p); media rows are LEFT JOINed on
+// package_id plus mediaMatch. When emptyMedia is true a package without media gets an
+// empty slice instead of nil.
+func selectPackagesWithMedia(packageQuery, mediaTable, mediaMatch string, vals []any, emptyMedia bool) (*constants.AnswerState, []manifest.OnboardPackageResp) {
+	qr := fmt.Sprintf(`SELECT p.package_id, p.title, p.remark, p.vehicle_id, m.media_id, m.media_type, m.media_link
+		FROM (%s) p LEFT JOIN %s m ON m.package_id = p.package_id%s`, packageQuery, mediaTable, mediaMatch)
+
 	st, rows := gendb.SelectGeneral(qr, vals)
 	if st.State != constants.SuccessState {
 		return st, nil
@@ -549,44 +541,37 @@ func SelectVehicleTimelinePackages(vehicleId string, archivedAt *time.Time) (*co
 	defer rows.Close()
 
 	result := []manifest.OnboardPackageResp{}
+	index := map[string]int{}
 	for rows.Next() {
-		var row manifest.OnboardPackageResp
-		if err := rows.Scan(&row.PackageId, &row.Title, &row.Remark, &row.VehicleId); err != nil {
+		var pkg manifest.OnboardPackageResp
+		var mediaId, mediaType, mediaLink sql.NullString
+		if err := rows.Scan(&pkg.PackageId, &pkg.Title, &pkg.Remark, &pkg.VehicleId, &mediaId, &mediaType, &mediaLink); err != nil {
 			slog.Error(err.Error())
-			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to bind timeline package data", Adv: "none"}, nil
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to bind on board package details", Adv: "none"}, nil
 		}
 
-		mediaQr := fmt.Sprintf("SELECT media_id, media_type, media_link, package_id FROM %s WHERE package_id = ?", mediaTable)
-		mediaVals := []any{row.PackageId}
-		if archivedAt != nil {
-			mediaQr += " AND archived_at = ?"
-			mediaVals = append(mediaVals, *archivedAt)
-		}
-
-		stm, mediaRows := gendb.SelectGeneral(mediaQr, mediaVals)
-		if stm.State != constants.SuccessState {
-			return stm, nil
-		}
-
-		mediaList := []manifest.OnBoardPackageMediaResp{}
-		for mediaRows.Next() {
-			var media manifest.OnBoardPackageMediaResp
-			if err := mediaRows.Scan(&media.MediaId, &media.MediaType, &media.MediaLink, &media.PackageId); err != nil {
-				mediaRows.Close()
-				slog.Error(err.Error())
-				return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to bind timeline package media", Adv: "none"}, nil
+		pos, seen := index[pkg.PackageId]
+		if !seen {
+			if emptyMedia {
+				pkg.Media = []manifest.OnBoardPackageMediaResp{}
 			}
-			mediaList = append(mediaList, media)
+			result = append(result, pkg)
+			pos = len(result) - 1
+			index[pkg.PackageId] = pos
 		}
-		mediaRows.Close()
-
-		row.Media = mediaList
-		result = append(result, row)
+		if mediaId.Valid {
+			result[pos].Media = append(result[pos].Media, manifest.OnBoardPackageMediaResp{
+				MediaId:   mediaId.String,
+				MediaType: mediaType.String,
+				MediaLink: mediaLink.String,
+				PackageId: pkg.PackageId,
+			})
+		}
 	}
 
 	if err := rows.Err(); err != nil {
 		slog.Error(err.Error())
-		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to iterate timeline package data", Adv: "none"}, nil
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to iterate on board package details", Adv: "none"}, nil
 	}
 
 	return &constants.AnswerState{State: constants.SuccessState, Data: "success", Adv: "none"}, result
@@ -911,57 +896,9 @@ func SelectInspectionImages(subQuery string, vals []any) (*constants.AnswerState
 	}, rows
 }
 func SelectOnBoardPackage(subQuery string, vals []any) (*constants.AnswerState, []manifest.OnboardPackageResp) {
-	qr := "SELECT `package_id`, `title`, `remark`, `vehicle_id` FROM `onboard_packages` WHERE " + subQuery
-
-	st, res := gendb.SelectGeneral(qr, vals)
-	if st.State != constants.SuccessState {
-		return st, nil
-	}
-
-	rows := []manifest.OnboardPackageResp{}
-
-	defer res.Close()
-
-	for res.Next() {
-		var row manifest.OnboardPackageResp
-		ers := res.Scan(&row.PackageId, &row.Title, &row.Remark, &row.VehicleId)
-		if ers != nil {
-			slog.Error(ers.Error())
-			return &constants.AnswerState{
-				State: constants.ErrorState,
-				Data:  "Failed to binding main on board package details",
-				Adv:   "none",
-			}, nil
-		}
-		// media
-		qri := "SELECT `media_id`, `media_type`, `media_link`, `package_id` FROM `onboard_packages_media` WHERE package_id = ?"
-		st, resm := gendb.SelectGeneral(qri, []any{row.PackageId})
-		if st.State != constants.SuccessState {
-			return st, nil
-		}
-
-		for resm.Next() {
-			var rowM manifest.OnBoardPackageMediaResp
-			ers := resm.Scan(&rowM.MediaId, &rowM.MediaType, &rowM.MediaLink, &rowM.PackageId)
-			if ers != nil {
-				slog.Error(ers.Error())
-				return &constants.AnswerState{
-					State: constants.ErrorState,
-					Data:  "Failed to binding media on board package details",
-					Adv:   "none",
-				}, nil
-			}
-			row.Media = append(row.Media, rowM)
-		}
-		rows = append(rows, row)
-	}
-
-	return &constants.AnswerState{
-		State: constants.SuccessState,
-		Data:  "success",
-		Adv:   "none",
-	}, rows
-
+	return selectPackagesWithMedia(
+		"SELECT `package_id`, `title`, `remark`, `vehicle_id` FROM `onboard_packages` WHERE "+subQuery,
+		"onboard_packages_media", "", vals, false)
 }
 
 func SelectVehicleMedia(subQuery string, vals []any) (*constants.AnswerState, []manifest.VehicleMediaResp) {
@@ -1429,4 +1366,217 @@ func SelectPackageInspectionData(subQuery string, vals []any) (*constants.Answer
 		Adv:   "none",
 	}, rows
 
+}
+
+// VehicleListExtras holds the per-vehicle details that list endpoints show next to
+// the manifest_vehicles row.
+type VehicleListExtras struct {
+	Maker          string
+	BodyType       string
+	DeckNumber     string
+	Image          string
+	NumberOfKeys   int
+	InspectedBy    string
+	IsDamaged      bool
+	HistoryBatches int
+	HasActiveTally bool
+}
+
+// SelectVehicleListExtras loads tally, inspector, damage and history details for many
+// vehicles with three queries in total, instead of several queries per vehicle.
+func SelectVehicleListExtras(vehicleIds []string) (*constants.AnswerState, map[string]*VehicleListExtras) {
+	extras := make(map[string]*VehicleListExtras, len(vehicleIds))
+	if len(vehicleIds) == 0 {
+		return &constants.AnswerState{State: constants.SuccessState, Data: "success", Adv: "none"}, extras
+	}
+
+	ids := make([]any, len(vehicleIds))
+	for i, id := range vehicleIds {
+		ids[i] = id
+		extras[id] = &VehicleListExtras{}
+	}
+	in := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+
+	// 1. Tally details with maker, body and inspector names.
+	qr := `SELECT vt.vehicle_id, vm.maker_name, vb.body_name, vt.deck_number, vt.image_link, vt.number_of_keys,
+		COALESCE(CONCAT(u.fname, ' ', u.lname), '')
+		FROM vehicles_talling vt
+		INNER JOIN vehicle_makers vm ON vm.maker_id = vt.maker_id
+		INNER JOIN vehicle_bodies vb ON vb.body_id = vt.body_id
+		LEFT JOIN users u ON u.user_id = vt.user_id
+		WHERE vt.vehicle_id IN (` + in + `)`
+	st, rows := gendb.SelectGeneral(qr, ids)
+	if st.State != constants.SuccessState {
+		return st, extras
+	}
+	for rows.Next() {
+		var id string
+		var e VehicleListExtras
+		if err := rows.Scan(&id, &e.Maker, &e.BodyType, &e.DeckNumber, &e.Image, &e.NumberOfKeys, &e.InspectedBy); err != nil {
+			rows.Close()
+			slog.Error(err.Error())
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to bind vehicle tally details", Adv: "none"}, extras
+		}
+		e.HasActiveTally = true
+		extras[id] = &e
+	}
+	rows.Close()
+
+	// 2. Damaged vehicles: a damaged or missing check, or a damage remark.
+	damageVals := append(append([]any{}, ids...), manifest.InspectionMarkStatus.Damaged, manifest.InspectionMarkStatus.Missing)
+	damageVals = append(append(damageVals, ids...), manifest.RemarkStatus.Damaged)
+	qr = `SELECT DISTINCT vehicle_id FROM vehicles_inspection WHERE vehicle_id IN (` + in + `) AND (status = ? OR status = ?)
+		UNION
+		SELECT DISTINCT vehicle_id FROM inspection_remarks WHERE vehicle_id IN (` + in + `) AND remark_type = ?`
+	st, rows = gendb.SelectGeneral(qr, damageVals)
+	if st.State != constants.SuccessState {
+		return st, extras
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			slog.Error(err.Error())
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to bind vehicle damage details", Adv: "none"}, extras
+		}
+		if e, ok := extras[id]; ok {
+			e.IsDamaged = true
+		}
+	}
+	rows.Close()
+
+	// 3. Number of archived inspection batches per vehicle.
+	qr = `SELECT vehicle_id, COUNT(DISTINCT archived_at) FROM vehicles_talling_history WHERE vehicle_id IN (` + in + `) GROUP BY vehicle_id`
+	st, rows = gendb.SelectGeneral(qr, ids)
+	if st.State != constants.SuccessState {
+		return st, extras
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var batches int
+		if err := rows.Scan(&id, &batches); err != nil {
+			slog.Error(err.Error())
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to bind vehicle history details", Adv: "none"}, extras
+		}
+		if e, ok := extras[id]; ok {
+			e.HistoryBatches = batches
+		}
+	}
+
+	return &constants.AnswerState{State: constants.SuccessState, Data: "success", Adv: "none"}, extras
+}
+
+// InspectionCheckForPublish is one check result with its fault image, as sent to the
+// remote server.
+type InspectionCheckForPublish struct {
+	CheckId    string
+	Status     string
+	FaultImage string
+}
+
+// SelectInspectionChecksForPublish reads all check results of a vehicle with their
+// fault image in one query.
+func SelectInspectionChecksForPublish(vehicleId string) (*constants.AnswerState, []InspectionCheckForPublish) {
+	qr := `SELECT vi.check_id, vi.status,
+		COALESCE((SELECT ii.image_link FROM inspection_image ii WHERE ii.inspection_id = vi.inspection_id ORDER BY ii.creation_time DESC LIMIT 1), '')
+		FROM vehicles_inspection vi WHERE vi.vehicle_id = ?`
+	st, rows := gendb.SelectGeneral(qr, []any{vehicleId})
+	if st.State != constants.SuccessState {
+		return st, nil
+	}
+	defer rows.Close()
+
+	result := []InspectionCheckForPublish{}
+	for rows.Next() {
+		var row InspectionCheckForPublish
+		if err := rows.Scan(&row.CheckId, &row.Status, &row.FaultImage); err != nil {
+			slog.Error(err.Error())
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to bind inspection checks", Adv: "none"}, nil
+		}
+		result = append(result, row)
+	}
+	if err := rows.Err(); err != nil {
+		slog.Error(err.Error())
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to iterate inspection checks", Adv: "none"}, nil
+	}
+
+	return &constants.AnswerState{State: constants.SuccessState, Data: "success", Adv: "none"}, result
+}
+
+// VehicleStatusRow is the compact inspection and publish status of one vehicle, as
+// the tablets keep it in their local list.
+type VehicleStatusRow struct {
+	VehicleId        string `json:"vehicleId"`
+	ChasisNumber     string `json:"chasisNumber"`
+	BLNumber         string `json:"blNumber"`
+	InspectionStatus string `json:"inspectionStatus"`
+	IsInspected      bool   `json:"isInspected"`
+	InspectionTime   string `json:"inspectionTime"`
+	InspectedBy      string `json:"inspectedBy"`
+	IsPublished      string `json:"isPublished"`
+	HasHistory       bool   `json:"hasHistory"`
+	UpdatedAt        string `json:"updatedAt"`
+}
+
+// SelectVehicleStatusChanges returns the vehicles of a manifest that changed at or
+// after since, or all of them when since is empty or manifest_vehicles has no
+// updated_at column yet (full is then true). cursor is the value the tablet sends as
+// since on its next call; it lies a few seconds in the past so that a save that was
+// still committing is not missed. Rows can therefore repeat; tablets merge them by
+// vehicleId.
+func SelectVehicleStatusChanges(manifestId, since string) (st *constants.AnswerState, rows []VehicleStatusRow, cursor string, full bool) {
+	db, err := gendb.InitDb()
+	if err != nil {
+		return &constants.AnswerState{State: constants.ErrorState, Data: err.Error(), Adv: "none"}, nil, "", false
+	}
+
+	hasUpdatedAt := gendb.ColumnExists("manifest_vehicles", "updated_at")
+	if err := db.QueryRow("SELECT DATE_FORMAT(NOW(3) - INTERVAL 10 SECOND, '%Y-%m-%d %H:%i:%s.%f')").Scan(&cursor); err != nil {
+		slog.Error(err.Error())
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to read server time", Adv: "none"}, nil, "", false
+	}
+
+	updatedAt := "''"
+	if hasUpdatedAt {
+		updatedAt = "DATE_FORMAT(mv.updated_at, '%Y-%m-%d %H:%i:%s.%f')"
+	}
+	qr := `SELECT mv.vehicle_id, mv.chasis_number, mv.bl_no, mv.inspection_status, mv.inspection_time, mv.is_published,
+		COALESCE(CONCAT(u.fname, ' ', u.lname), ''),
+		EXISTS (SELECT 1 FROM vehicles_talling_history h WHERE h.vehicle_id = mv.vehicle_id),
+		` + updatedAt + `
+		FROM manifest_vehicles mv
+		LEFT JOIN vehicles_talling vt ON vt.vehicle_id = mv.vehicle_id
+		LEFT JOIN users u ON u.user_id = vt.user_id
+		WHERE mv.manifest_id = ?`
+	vals := []any{manifestId}
+	full = since == "" || !hasUpdatedAt
+	if !full {
+		qr += " AND mv.updated_at >= ?"
+		vals = append(vals, since)
+	}
+
+	stq, res := gendb.SelectGeneral(qr, vals)
+	if stq.State != constants.SuccessState {
+		return stq, nil, "", false
+	}
+	defer res.Close()
+
+	rows = []VehicleStatusRow{}
+	for res.Next() {
+		var row VehicleStatusRow
+		if err := res.Scan(&row.VehicleId, &row.ChasisNumber, &row.BLNumber, &row.InspectionStatus, &row.InspectionTime,
+			&row.IsPublished, &row.InspectedBy, &row.HasHistory, &row.UpdatedAt); err != nil {
+			slog.Error(err.Error())
+			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to bind vehicle status", Adv: "none"}, nil, "", false
+		}
+		row.IsInspected = row.InspectionStatus == manifest.InspectionStatus.Yes
+		rows = append(rows, row)
+	}
+	if err := res.Err(); err != nil {
+		slog.Error(err.Error())
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to iterate vehicle status", Adv: "none"}, nil, "", false
+	}
+
+	return &constants.AnswerState{State: constants.SuccessState, Data: "success", Adv: "none"}, rows, cursor, full
 }

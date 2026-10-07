@@ -31,11 +31,11 @@ func GetManifestLists(logId, logKey, query string, page, limit int) (data []mani
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, err
+		return nil, fmt.Errorf("remote server returned status %d on %s", resp.StatusCode, url)
 	}
 
 	if manifestListResponse.State != constants.SuccessState {
-		return nil, err
+		return nil, fmt.Errorf("failed to fetch manifest list: %s", resp.Message)
 	}
 
 	return manifestListResponse.Data, nil
@@ -61,8 +61,12 @@ func UploadSingleVehicleToRemote(logId, logKey string, req manifest.AddVehicleRe
 	}
 
 	if response.State != constants.SuccessState {
-		slog.Error(fmt.Sprintf("Failed to upload vehicle, state: %s", response.State))
-		return "", err
+		slog.Error(fmt.Sprintf("Failed to upload vehicle, state: %s, data: %s", response.State, response.Data))
+		return "", fmt.Errorf("remote rejected vehicle: %s", response.Data)
+	}
+
+	if response.Adv == "" {
+		return "", fmt.Errorf("remote accepted vehicle but returned no vehicle id")
 	}
 
 	return response.Adv, nil
@@ -88,8 +92,12 @@ func UploadSinglePackageToRemote(logId, logKey string, req manifest.AddPackageRe
 	}
 
 	if response.State != constants.SuccessState {
-		slog.Error(fmt.Sprintf("Failed to upload package, state: %s", response.State))
-		return "", err
+		slog.Error(fmt.Sprintf("Failed to upload package, state: %s, data: %s", response.State, response.Data))
+		return "", fmt.Errorf("remote rejected package: %s", response.Data)
+	}
+
+	if response.Adv == "" {
+		return "", fmt.Errorf("remote accepted package but returned no package id")
 	}
 
 	return response.Adv, nil

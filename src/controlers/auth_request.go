@@ -1,14 +1,14 @@
 package controlers
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
-	"github.com/shabs76/roro-local-server/base_api"
+	apiservices "github.com/shabs76/roro-local-server/api_services"
 	"github.com/shabs76/roro-local-server/constants"
-	baseapi "github.com/shabs76/roro-local-server/constants/modules/base_api"
 	"github.com/shabs76/roro-local-server/constants/modules/users"
 	usersdataservices "github.com/shabs76/roro-local-server/database/users_data_services"
 	"github.com/shabs76/roro-local-server/specials"
@@ -64,35 +64,22 @@ func LoginUser(c *gin.Context) {
 	}
 
 	// send login request to remote server
-	remoteBaseUrl := specials.GetEnvVariable("REMOTE_SERVER_URL", "http://localhost:8000")
-	client := base_api.NewAPI(remoteBaseUrl)
-	var logRespo users.UserLoginResponse
-
-	resp, err := client.Post(
-		"/auth/login",
-		req, &logRespo,
-		[]baseapi.Header{
-			{Key: "Content-Type", Value: "application/json"},
-		},
-	)
-
+	logRespo, err := apiservices.RemoteLogin(req)
 	if err != nil {
 		slog.Error(err.Error())
+		if errors.Is(err, apiservices.ErrRemoteLoginRefused) {
+			c.JSON(http.StatusUnauthorized, constants.NormalResponse{
+				State:   constants.ErrorState,
+				Data:    err.Error(),
+				Message: "Authentication failed",
+				Adv:     "none",
+			})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, constants.NormalResponse{
 			State:   constants.ErrorState,
-			Data:    fmt.Sprintf("failed to login to the remote server, due to %s", resp.Message),
+			Data:    fmt.Sprintf("failed to login to the remote server, due to %s", err.Error()),
 			Message: "An error occurred while logging in to the remote server",
-			Adv:     "none",
-		})
-		return
-	}
-
-	// extra error check
-	if resp.Status != constants.SuccessState {
-		c.JSON(http.StatusUnauthorized, constants.NormalResponse{
-			State:   constants.ErrorState,
-			Data:    resp.Message,
-			Message: "Authentication failed",
 			Adv:     "none",
 		})
 		return

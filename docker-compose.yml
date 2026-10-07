@@ -10,6 +10,9 @@ services:
     volumes:
       # Persist database data across container restarts
       - db_data:/var/lib/mysql
+      # Creates all tables the first time the database volume is created (an empty
+      # db_data volume). Later starts keep the existing data and skip this file.
+      - ./roro_local.sql:/docker-entrypoint-initdb.d/01_roro_local.sql:ro
     ports:
       - "3306:3306"
     healthcheck:

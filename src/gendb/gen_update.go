@@ -18,8 +18,6 @@ func UpdateGeneral(sq string, vals []any) *constants.AnswerState {
 		}
 	}
 
-	defer db.Close()
-
 	res, err := db.Exec(sq, vals...)
 	if err != nil {
 		slog.Error(err.Error())

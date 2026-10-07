@@ -54,8 +54,5 @@ Thumbs.db
 
 **/tempdf/
 
-# Ignore sql files
-*.sql
-
 src/media_data/*
 !src/media_data/folder_holder.txt

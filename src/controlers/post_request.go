@@ -46,9 +46,29 @@ func SaveVehicleInspectionDetails(c *gin.Context) {
 	}
 
 	st := manifestdataservices.InsertInspectionTallyRemarks(req, userId)
-	if st.State != constants.SuccessState {
-		c.JSON(http.StatusInternalServerError, st)
+	if st.Adv == manifestdataservices.InspectionSaveConflict {
+		// Another inspection already exists and the tablet did not confirm a
+		// re-inspection. Tell it who inspected the vehicle and when.
+		conflict := gin.H{"message": st.Data, "inspectedBy": "", "inspectionTime": ""}
+		if stv, vehicles := manifestdataservices.SelectVehicleInfo(" `vehicle_id` = ? ", []any{req.VehicleId}); stv.State == constants.SuccessState && len(vehicles) > 0 {
+			conflict["inspectionTime"] = vehicles[0].InspectionTime
+		}
+		if ste, extras := manifestdataservices.SelectVehicleListExtras([]string{req.VehicleId}); ste.State == constants.SuccessState && extras[req.VehicleId] != nil {
+			conflict["inspectedBy"] = extras[req.VehicleId].InspectedBy
+		}
+		c.JSON(http.StatusConflict, gin.H{"state": "conflict", "data": conflict, "adv": st.Adv})
 		return
+	}
+	if st.State != constants.SuccessState {
+		c.JSON(saveErrorStatus(st), st)
+		return
+	}
+
+	switch st.Adv {
+	case manifestdataservices.InspectionSaveNew:
+		vehicleEvents.notify(req.ManifestId, req.VehicleId, "inspected")
+	case manifestdataservices.InspectionSaveReinspect:
+		vehicleEvents.notify(req.ManifestId, req.VehicleId, "reinspected")
 	}
 
 	c.JSON(http.StatusOK, st)
@@ -160,9 +180,10 @@ func SaveVehicleRemarksOnly(c *gin.Context) {
 
 	st := manifestdataservices.InsertVehicleRemarksOnly(req, user.UserID)
 	if st.State != constants.SuccessState {
-		c.JSON(http.StatusInternalServerError, st)
+		c.JSON(saveErrorStatus(st), st)
 		return
 	}
+	notifyVehicleChanged(req.VehicleId, "remarks")
 
 	c.JSON(http.StatusOK, st)
 }
@@ -330,9 +351,23 @@ func SavePackageInspectionDetails(c *gin.Context) {
 
 	st := manifestdataservices.InsertPackageInspection(req, user.UserID)
 	if st.State != constants.SuccessState {
-		c.JSON(http.StatusInternalServerError, st)
+		c.JSON(saveErrorStatus(st), st)
 		return
 	}
 
 	c.JSON(http.StatusOK, st)
+}
+
+// saveErrorStatus picks the HTTP status of a failed save. Errors a retry cannot fix get
+// a 4xx code, so tablets stop retrying and show the item as needing attention; only
+// errors that may pass (database busy, connection lost) stay 500.
+func saveErrorStatus(st *constants.AnswerState) int {
+	switch st.Adv {
+	case manifestdataservices.SaveErrNotFound:
+		return http.StatusNotFound
+	case manifestdataservices.SaveErrInvalidReference:
+		return http.StatusUnprocessableEntity
+	default:
+		return http.StatusInternalServerError
+	}
 }

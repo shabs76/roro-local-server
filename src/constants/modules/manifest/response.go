@@ -101,6 +101,9 @@ type VehiclesDetailsToShow struct {
 	IsOverLand       string  `json:"isOverLand" binding:"required"`
 	BLNumber         string  `json:"blNumber" binding:"required"`
 	NumberOfKeys     int     `json:"numberOfKeys" binding:"required"`
+	IsPublished      string  `json:"isPublished"`
+	InspectedBy      string  `json:"inspectedBy"`
+	InspectionCount  int     `json:"inspectionCount"`
 }
 
 type ManifestData struct {

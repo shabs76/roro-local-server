@@ -14,5 +14,6 @@ func SetupSSESyncRoutes(router *gin.Engine) {
 		sseGroup.GET("/manifest/manual/:manifest-id", controlers.ManifestDataSyncSSE)
 		sseGroup.GET("/trigger/publish/:manifestId", controlers.PublishVehiclesAndPackagesInspectionSSE)
 		sseGroup.GET("/trigger/added-later/publish/:manifestId", controlers.PublishAddedLaterVehiclesAndPackagesSSE)
+		sseGroup.GET("/events/:manifestId", controlers.VehicleEventsSSE)
 	}
 }

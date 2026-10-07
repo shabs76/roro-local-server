@@ -206,8 +206,8 @@ func UploadVehicleInspectionData(logId, logKey string, req manifest.InspectionCh
 	}
 
 	if response.State != constants.SuccessState {
-		slog.Error(fmt.Sprintf("Failed to upload inspection data, state: %s", response.State))
-		return nil, err
+		slog.Error(fmt.Sprintf("Failed to upload inspection data, state: %s, data: %s", response.State, response.Data))
+		return nil, fmt.Errorf("remote rejected inspection data: %s", response.Data)
 	}
 
 	return &response, nil
@@ -233,8 +233,8 @@ func UploadPackageInspectionData(logId, logKey string, req manifest.PackageInspe
 	}
 
 	if response.State != constants.SuccessState {
-		slog.Error(fmt.Sprintf("Failed to upload package inspection data, state: %s", response.State))
-		return nil, err
+		slog.Error(fmt.Sprintf("Failed to upload package inspection data, state: %s, data: %s", response.State, response.Data))
+		return nil, fmt.Errorf("remote rejected package inspection data: %s", response.Data)
 	}
 
 	return &response, nil

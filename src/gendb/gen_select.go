@@ -20,8 +20,6 @@ func SelectGeneral(sq string, vals []any) (*constants.AnswerState, *sql.Rows) {
 		}, nil
 	}
 
-	defer db.Close()
-
 	res, err := db.Query(sq, vals...)
 	if err != nil {
 		slog.Error(err.Error())
@@ -49,7 +47,6 @@ func PagenationSelect(query string, pgn, perPage int, vals []any) (*constants.An
 		}, nil
 	}
 
-	defer db.Close()
 	res, err := db.Query(query, vals...)
 	if err != nil {
 		slog.Error(err.Error())
@@ -59,6 +56,7 @@ func PagenationSelect(query string, pgn, perPage int, vals []any) (*constants.An
 			Adv:   "none",
 		}, nil
 	}
+	defer res.Close()
 
 	type numTy struct {
 		ResNum int

@@ -10,8 +10,9 @@ func UpdateVehicleIdToRemote(oldID, newId string) *constants.AnswerState {
 	qr := "UPDATE `manifest_vehicles` SET `vehicle_id`= ?,`is_added_later`= ? WHERE `vehicle_id` = ?"
 	vals := []any{newId, manifest.InspectionStatus.No, oldID}
 	stx := gendb.UpdateGeneral(qr, vals)
-	if stx.State != constants.SuccessState && stx.Adv != "okay" {
-		return stx
+	if stx.State != constants.SuccessState {
+		// No changed row means the old id does not exist: the remote id was not stored.
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to store remote id: " + stx.Data, Adv: "none"}
 	}
 	return &constants.AnswerState{State: constants.SuccessState, Data: "Vehicle ID updated successfully", Adv: "okay"}
 }
@@ -20,8 +21,9 @@ func UpdatePackageIdToRemote(oldID, newId string) *constants.AnswerState {
 	qr := "UPDATE `manifest_packages` SET `package_id`= ?,`is_added_later`= ? WHERE `package_id` = ?"
 	vals := []any{newId, manifest.InspectionStatus.No, oldID}
 	stx := gendb.UpdateGeneral(qr, vals)
-	if stx.State != constants.SuccessState && stx.Adv != "okay" {
-		return stx
+	if stx.State != constants.SuccessState {
+		// No changed row means the old id does not exist: the remote id was not stored.
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to store remote id: " + stx.Data, Adv: "none"}
 	}
 	return &constants.AnswerState{State: constants.SuccessState, Data: "Package ID updated successfully", Adv: "okay"}
 }

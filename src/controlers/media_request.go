@@ -1,7 +1,11 @@
 package controlers
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -11,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/shabs76/roro-local-server/constants"
+	manifestdataservices "github.com/shabs76/roro-local-server/database/manifest_data_services"
 )
 
 // ensureDir creates the directory if it doesn't exist
@@ -44,7 +49,13 @@ func UploadMedia(c *gin.Context) {
 	if err != nil {
 		slog.Error("File is missing or could not get it from the upload.")
 		slog.Error(err.Error())
-		c.JSON(http.StatusBadRequest, gin.H{"state": constants.ErrorState, "data": "No file uploaded"})
+		if errors.Is(err, http.ErrMissingFile) || errors.Is(err, http.ErrNotMultipart) {
+			c.JSON(http.StatusBadRequest, gin.H{"state": constants.ErrorState, "data": "No file uploaded"})
+			return
+		}
+		// The body stopped arriving (slow Wi-Fi, connection dropped, read deadline).
+		// A retry can succeed, so this is not reported as a bad request.
+		c.JSON(http.StatusRequestTimeout, gin.H{"state": constants.ErrorState, "data": "The upload was interrupted. Please try again."})
 		return
 	}
 
@@ -62,10 +73,8 @@ func UploadMedia(c *gin.Context) {
 	// Sanitize filename
 	name = filepath.Base(name)
 
-	// Append UNIX timestamp to ensure uniqueness
 	ext := filepath.Ext(name)
 	nameWithoutExt := strings.ReplaceAll(strings.TrimSuffix(name, ext), " ", "_")
-	name = fmt.Sprintf("%s_%d%s", nameWithoutExt, time.Now().Unix(), ext)
 
 	mediaType := getMediaType(file.Filename)
 	saveDir := filepath.Join(constants.MediaBaseDir, mediaType)
@@ -75,20 +84,104 @@ func UploadMedia(c *gin.Context) {
 		return
 	}
 
-	dst := filepath.Join(saveDir, name) // Use 'name' here, not filepath.Base(name) again
-	if err := c.SaveUploadedFile(file, dst); err != nil {
+	if file.Size == 0 {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"state": constants.ErrorState, "data": "The uploaded file is empty"})
+		return
+	}
+
+	// Copy into a temporary file next to the destination while hashing it.
+	src, err := file.Open()
+	if err != nil {
+		slog.Error("Failed to open uploaded file", "error", err)
+		c.JSON(http.StatusBadRequest, gin.H{"state": constants.ErrorState, "data": "The uploaded file could not be read"})
+		return
+	}
+	defer src.Close()
+
+	tmp, err := os.CreateTemp(saveDir, ".upload-*")
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"state": constants.ErrorState, "data": "Failed to save file"})
 		return
 	}
+	hash := sha256.New()
+	_, copyErr := io.Copy(io.MultiWriter(tmp, hash), src)
+	closeErr := tmp.Close()
+	if copyErr != nil || closeErr != nil {
+		os.Remove(tmp.Name())
+		slog.Error("Failed to store uploaded file", "copyError", copyErr, "closeError", closeErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"state": constants.ErrorState, "data": "Failed to save file"})
+		return
+	}
+	sum := hex.EncodeToString(hash.Sum(nil))
+
+	// The same content was stored before (older app builds upload a photo again on
+	// every retry): answer with that file instead of keeping another copy.
+	if url, ok := manifestdataservices.FindMediaFile(sum); ok {
+		existing := filepath.Join(constants.MediaBaseDir, url)
+		if info, err := os.Stat(existing); err == nil && !info.IsDir() {
+			os.Remove(tmp.Name())
+			respondUploaded(c, url, filepath.Dir(url), filepath.Base(url), existing)
+			return
+		}
+	}
+
+	// Different tablets can send different photos under the same name in the same
+	// second. The stored name therefore carries part of the content hash, and the file
+	// is placed without ever replacing an existing one.
+	name, err = storeUnique(tmp.Name(), saveDir,
+		fmt.Sprintf("%s_%d_%s", nameWithoutExt, time.Now().Unix(), sum[:12]), ext)
+	if err != nil {
+		os.Remove(tmp.Name())
+		slog.Error("Failed to store uploaded file", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"state": constants.ErrorState, "data": "Failed to save file"})
+		return
+	}
+	dst := filepath.Join(saveDir, name)
 	url := fmt.Sprintf("%s/%s", mediaType, name)
+	manifestdataservices.SaveMediaFile(sum, url, file.Size)
+	respondUploaded(c, url, mediaType, name, dst)
+}
+
+// storeUnique moves the temporary file into dir as base+ext, or base_2+ext,
+// base_3+ext ... when that name is taken. os.Link fails when the target exists, so a
+// file stored by another upload is never replaced, even by an upload running at the
+// same moment. It returns the stored file name.
+func storeUnique(tmpPath, dir, base, ext string) (string, error) {
+	for i := 1; i <= 100; i++ {
+		name := base + ext
+		if i > 1 {
+			name = fmt.Sprintf("%s_%d%s", base, i, ext)
+		}
+		dst := filepath.Join(dir, name)
+		err := os.Link(tmpPath, dst)
+		if err == nil {
+			os.Remove(tmpPath)
+			return name, nil
+		}
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		// The file system cannot hard-link: fall back to a rename, still only onto a
+		// name that is free.
+		if _, statErr := os.Stat(dst); errors.Is(statErr, os.ErrNotExist) {
+			if err := os.Rename(tmpPath, dst); err != nil {
+				return "", err
+			}
+			return name, nil
+		}
+	}
+	return "", fmt.Errorf("no free file name for %s%s", base, ext)
+}
+
+func respondUploaded(c *gin.Context, url, mediaType, filename, path string) {
 	c.JSON(http.StatusOK, gin.H{
 		"state":   constants.SuccessState,
 		"message": "File uploaded successfully",
 		"info": gin.H{
 			"url":      url,
 			"type":     mediaType,
-			"filename": name,
-			"path":     dst,
+			"filename": filename,
+			"path":     path,
 		},
 		"data": url,
 	})

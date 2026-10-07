@@ -1,6 +1,8 @@
 package routes
 
 import (
+	"time"
+
 	"github.com/gin-gonic/gin"
 	"github.com/shabs76/roro-local-server/controlers"
 	"github.com/shabs76/roro-local-server/pkg/middleware"
@@ -12,7 +14,8 @@ func SetupManifestRoutes(router *gin.Engine) {
 		// Media routes
 		media := manifestGroup.Group("/media")
 		{
-			media.POST("/upload/file", controlers.UploadMedia)
+			// Large videos over weak Wi-Fi can take long; allow 30 minutes for the body.
+			media.POST("/upload/file", middleware.BodyReadDeadline(30*time.Minute), controlers.UploadMedia)
 			media.GET("/get/file", controlers.GetFile)
 			media.GET("/get/full/file", controlers.PlayMedia)
 		}
@@ -32,6 +35,11 @@ func SetupManifestRoutes(router *gin.Engine) {
 			veh.GET("/list/with/multiple/inspections/:manifestId", controlers.GetVehicleWithMultipleInspections)
 			veh.GET("/multiple/inspection/details/:vehicleId", controlers.GetVehicleInspectionTallyTimeline)
 			veh.GET("/list/inspection/check/:manifestId", controlers.GetVehicleShortInfo) // this is used to check if the vehicle is inspected or not in the manifest list page
+			veh.GET("/status/:manifestId", controlers.GetVehicleStatusChanges)            // ?since=<cursor> returns only vehicles changed since the cursor
+			// tablet-vs-server comparison
+			veh.POST("/compare/:manifestId", controlers.CompareTabletWithServer)
+			veh.GET("/compare/reports/:manifestId", controlers.GetCompareReports)
+			veh.GET("/compare/report/:reportId", controlers.GetCompareReport)
 		}
 		// package routes
 		pack := manifestGroup.Group("/packages")

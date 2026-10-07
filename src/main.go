@@ -12,6 +12,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/lpernett/godotenv"
+	apiservices "github.com/shabs76/roro-local-server/api_services"
+	"github.com/shabs76/roro-local-server/gendb"
 	"github.com/shabs76/roro-local-server/pkg/logger"
 	"github.com/shabs76/roro-local-server/pkg/middleware"
 	"github.com/shabs76/roro-local-server/routes"
@@ -34,6 +36,21 @@ func main() {
 	// Initialize our custom logger (writes to file + stdout)
 	logger.Setup(logDir, "server.log")
 
+	// 2.5 Apply schema migrations. Code that needs migrated columns checks for them, so
+	// the server also runs on an unmigrated schema, without those features: submission
+	// ids, the status change cursor and the publish upload cache.
+	if err := gendb.RunMigrations(60 * time.Second); err != nil {
+		slog.Error("Database migrations not fully applied; some inspection features stay off until an administrator applies them", "error", err)
+	}
+
+	// 2.6 Pull roles, users and reference lists from the remote server as the initial
+	// user (INIT_USER_EMAIL / INIT_USER_PASSWORD). Runs in the background and retries
+	// while the remote server cannot be reached; a fresh install needs it before
+	// anyone can log in.
+	syncCtx, stopSync := context.WithCancel(context.Background())
+	defer stopSync()
+	go apiservices.SyncFromRemoteAtStart(syncCtx)
+
 	// 3. Setup Gin
 	// Set Gin mode based on env
 	if os.Getenv("APP_ENV") == "production" {
@@ -51,6 +68,8 @@ func main() {
 	// r.Use(gin.Logger())
 	// Use custom detailed logger
 	r.Use(middleware.RequestLogger())
+	// Request bodies must arrive within 2 minutes; the media upload route allows longer.
+	r.Use(middleware.BodyReadDeadline(2 * time.Minute))
 
 	// 4. Define Routes
 	routes.SetupManifestRoutes(r)
@@ -81,8 +100,10 @@ func main() {
 	srv := &http.Server{
 		Addr:    ":" + port,
 		Handler: r,
-		// Good practice: set timeouts
-		ReadTimeout: 300 * time.Second,
+		// Only the headers have a server-wide limit. A ReadTimeout would cut slow photo
+		// uploads and end SSE streams (net/http cancels the request context when the read
+		// deadline passes); body deadlines are set per route by BodyReadDeadline.
+		ReadHeaderTimeout: 30 * time.Second,
 		// Removed WriteTimeout because it drops Server-Sent Events (SSE)
 		// connections unconditionally if they take longer than the timeout.
 		// WriteTimeout: 10 * time.Second,

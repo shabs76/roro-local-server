@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 )
@@ -43,15 +45,30 @@ func initVars() (string, string, string, string, string) {
 	return sdataHost, sdataPort, sdataUser, sdataPass, sdataName
 }
 
+var (
+	sharedDb     *sql.DB
+	sharedDbErr  error
+	sharedDbOnce sync.Once
+)
+
+// InitDb returns the process-wide connection pool. The pool is created on first
+// use and shared by every caller, so callers must NOT close it.
 func InitDb() (dbs *sql.DB, er error) {
-	dbHost, dbPort, dbUser, dbPassword, dbName := initVars()
-	db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%s)/%s", dbUser, dbPassword, dbHost, dbPort, dbName))
+	sharedDbOnce.Do(func() {
+		dbHost, dbPort, dbUser, dbPassword, dbName := initVars()
+		db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%s)/%s", dbUser, dbPassword, dbHost, dbPort, dbName))
+		if err != nil {
+			slog.Error(err.Error())
+			sharedDbErr = fmt.Errorf("unable to connect to the database")
+			return
+		}
 
-	if err != nil {
-		slog.Error(err.Error())
-		return nil, fmt.Errorf("unable to connect to the database")
-	}
+		db.SetMaxOpenConns(25)
+		db.SetMaxIdleConns(25)
+		db.SetConnMaxLifetime(5 * time.Minute)
+		db.SetConnMaxIdleTime(2 * time.Minute)
+		sharedDb = db
+	})
 
-	db.Prepare("")
-	return db, nil
+	return sharedDb, sharedDbErr
 }

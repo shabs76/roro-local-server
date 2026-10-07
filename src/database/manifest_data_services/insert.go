@@ -3,10 +3,14 @@ package manifestdataservices
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
+	"sync"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/shabs76/roro-local-server/constants"
 	"github.com/shabs76/roro-local-server/constants/modules/manifest"
 	"github.com/shabs76/roro-local-server/gendb"
@@ -248,6 +252,28 @@ func InsertClientDetail(data []manifest.ClientInfo) (st *constants.AnswerState) 
 	return &constants.AnswerState{State: constants.SuccessState, Data: "Client details were successfully synced", Adv: "none"}
 }
 
+// Adv values returned by InsertInspectionTallyRemarks so callers can tell the outcomes apart.
+const (
+	InspectionSaveNew       = "new"
+	InspectionSaveResend    = "resend"
+	InspectionSaveReinspect = "reinspection"
+	InspectionSaveConflict  = "conflict"
+)
+
+// Adv values of errors that a retry cannot fix. Handlers answer them with a 4xx code
+// so the tablets stop retrying and show the item as needing attention.
+const (
+	SaveErrNotFound         = "not_found"
+	SaveErrInvalidReference = "invalid_reference"
+)
+
+// invalidReference reports whether err is a foreign key failure (MySQL 1452): the
+// request names a check, maker, body or package that does not exist.
+func invalidReference(err error) bool {
+	var myErr *mysql.MySQLError
+	return errors.As(err, &myErr) && myErr.Number == 1452
+}
+
 func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId string) *constants.AnswerState {
 	// Create a context with timeout to prevent hanging operations
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -262,9 +288,9 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 			Adv:   "none",
 		}
 	}
-	defer db.Close()
 
-	// Use ReadCommitted isolation level for better performance while maintaining data integrity
+	// The whole save runs in ONE transaction. A failure leaves nothing behind, so a
+	// retry from the tablet never meets a half-saved inspection.
 	tx, err := db.BeginTx(ctx, &sql.TxOptions{
 		Isolation: sql.LevelReadCommitted,
 	})
@@ -286,34 +312,118 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 		}
 	}()
 
-	// ── Archive Block ──────────────────────────────────────────────────────────
-	// If a tally record already exists for this vehicle, move all of its active
-	// inspection data into the history tables before inserting fresh data.
-	// This preserves the full audit trail while keeping the active tables clean
-	// so that existing SELECT queries (which filter strictly by vehicle_id) always
-	// return only the most-recent inspection — no schema changes required.
-	var tallyExists bool
-	if err = tx.QueryRowContext(ctx,
-		"SELECT EXISTS(SELECT 1 FROM vehicles_talling WHERE vehicle_id = ?)",
-		req.VehicleId).Scan(&tallyExists); err != nil {
-		slog.Error(fmt.Sprintf("Archive existence check error: %v", err))
+	fail := func(msg string, err error) *constants.AnswerState {
+		slog.Error(fmt.Sprintf("%s for vehicle %s: %v", msg, req.VehicleId, err))
+		if invalidReference(err) {
+			return &constants.AnswerState{
+				State: constants.ErrorState,
+				Data:  msg + ": the inspection refers to a check, maker or body type that does not exist on this server",
+				Adv:   SaveErrInvalidReference,
+			}
+		}
 		return &constants.AnswerState{
 			State: constants.ErrorState,
-			Data:  "Failed to check for existing tally data",
+			Data:  msg,
 			Adv:   "none",
 		}
 	}
-	if tallyExists {
-		if archErr := archiveVehicleData(ctx, tx, req.VehicleId); archErr != nil {
-			slog.Error(fmt.Sprintf("Archive error for vehicle %s: %v", req.VehicleId, archErr))
-			return &constants.AnswerState{
-				State: constants.ErrorState,
-				Data:  "Failed to archive existing vehicle data",
-				Adv:   "none",
-			}
+
+	// 1. Lock the vehicle row. Saves for the same vehicle from several tablets now run
+	// one after another instead of interleaving.
+	var currentInspectionTime sql.NullString
+	err = tx.QueryRowContext(ctx,
+		"SELECT inspection_time FROM manifest_vehicles WHERE vehicle_id = ? FOR UPDATE",
+		req.VehicleId).Scan(&currentInspectionTime)
+	if err == sql.ErrNoRows {
+		return &constants.AnswerState{
+			State: constants.ErrorState,
+			Data:  "Vehicle was not found in the manifest",
+			Adv:   SaveErrNotFound,
 		}
 	}
-	// ── End Archive Block ──────────────────────────────────────────────────────
+	if err != nil {
+		return fail("Failed to lock vehicle record", err)
+	}
+
+	// 1b. Refuse ids this server does not know, before anything is written. The
+	// foreign keys would refuse them too, but this names the exact id for the tablet.
+	unknown, err := unknownInspectionReferences(ctx, tx, req)
+	if err != nil {
+		return fail("Failed to check the inspection's maker, body type and checks", err)
+	}
+	if len(unknown) > 0 {
+		slog.Warn("Inspection refers to unknown records", "vehicle", req.VehicleId, "unknown", strings.Join(unknown, ", "))
+		return &constants.AnswerState{
+			State: constants.ErrorState,
+			Data:  "Not known on this server: " + strings.Join(unknown, ", ") + ". Sync the tablet's lists, then send the inspection again.",
+			Adv:   SaveErrInvalidReference,
+		}
+	}
+
+	// 2. Read the active tally, if there is one. submission_id and manifest_id come
+	// from a migration; without them the save falls back to the older behaviour.
+	hasSubmissionId := gendb.ColumnExists("vehicles_talling", "submission_id")
+	hasTallyManifestId := gendb.ColumnExists("vehicles_talling", "manifest_id")
+
+	var tallyUserId string
+	var tallySubmissionId sql.NullString
+	tallyExists := true
+	if hasSubmissionId {
+		err = tx.QueryRowContext(ctx,
+			"SELECT user_id, submission_id FROM vehicles_talling WHERE vehicle_id = ?",
+			req.VehicleId).Scan(&tallyUserId, &tallySubmissionId)
+	} else {
+		err = tx.QueryRowContext(ctx,
+			"SELECT user_id FROM vehicles_talling WHERE vehicle_id = ?",
+			req.VehicleId).Scan(&tallyUserId)
+	}
+	if err == sql.ErrNoRows {
+		tallyExists = false
+	} else if err != nil {
+		return fail("Failed to check for existing tally data", err)
+	}
+
+	// 3. Decide whether this request is a new inspection, a resend of the inspection
+	// that is already saved, or a real re-inspection.
+	outcome := InspectionSaveNew
+	if tallyExists {
+		storedSubmissionId := tallySubmissionId.String
+		sameSubmission := req.SubmissionId != "" && storedSubmissionId == req.SubmissionId
+		// App builds without a submission id resend the same inspection time from the
+		// same user, so that pair identifies a resend.
+		legacyResend := (req.SubmissionId == "" || storedSubmissionId == "") &&
+			currentInspectionTime.String == req.InspectionTime &&
+			tallyUserId == userId
+		if sameSubmission || legacyResend {
+			outcome = InspectionSaveResend
+		} else {
+			outcome = InspectionSaveReinspect
+		}
+	}
+
+	if outcome == InspectionSaveReinspect && req.Reinspect != nil && !*req.Reinspect {
+		return &constants.AnswerState{
+			State: constants.ErrorState,
+			Data:  "This vehicle was already inspected. Confirm re-inspection to replace the existing inspection.",
+			Adv:   InspectionSaveConflict,
+		}
+	}
+
+	// 4. Clear the active rows. A real re-inspection is archived first. A resend is
+	// overwritten in place, so it never creates a history batch.
+	switch outcome {
+	case InspectionSaveReinspect:
+		if err := copyVehicleDataToHistory(ctx, tx, req.VehicleId); err != nil {
+			return fail("Failed to archive existing vehicle data", err)
+		}
+		if err := deleteActiveVehicleData(ctx, tx, req.VehicleId); err != nil {
+			return fail("Failed to archive existing vehicle data", err)
+		}
+	case InspectionSaveResend:
+		if err := deleteActiveVehicleData(ctx, tx, req.VehicleId); err != nil {
+			return fail("Failed to replace existing vehicle data", err)
+		}
+	}
 
 	// Pre-generate all IDs to avoid generating them during database operations
 	tallyId := specials.RandomString(36, "_TALLY")
@@ -366,54 +476,47 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 		packagez[i].mediaIds = medzIds
 	}
 
-	// 1. Insert tally details
-	tallyQr := `INSERT INTO vehicles_talling
-                (tally_id, vehicle_id, maker_id, body_id, image_link, deck_number, number_of_keys, key_type, user_id, tallied_time) 
-                VALUES (?,?,?,?,?,?,?,?,?,NOW())
-                ON DUPLICATE KEY UPDATE
-                maker_id = ?,
-                body_id = ?,
-                image_link = ?,
-                deck_number = ?,
-                number_of_keys = ?,
-                key_type = ?,
-                user_id = ?,
-                tallied_time = NOW()`
-
-	tallyVals := []any{
-		tallyId, req.VehicleId, req.MakerId, req.BodyId, req.VehicleImage, req.DeckNumber, req.NumberOfKeys, req.KeyType, userId,
-		req.MakerId, req.BodyId, req.VehicleImage, req.DeckNumber, req.NumberOfKeys, req.KeyType, userId,
+	// 5. Insert tally details. Any previous tally row was removed in step 4.
+	tallyCols := "tally_id, vehicle_id, maker_id, body_id, image_link, deck_number, number_of_keys, key_type, user_id"
+	tallyVals := []any{tallyId, req.VehicleId, req.MakerId, req.BodyId, req.VehicleImage, req.DeckNumber, req.NumberOfKeys, req.KeyType, userId}
+	if hasTallyManifestId {
+		tallyCols += ", manifest_id"
+		tallyVals = append(tallyVals, req.ManifestId)
 	}
-
-	_, err = tx.ExecContext(ctx, tallyQr, tallyVals...)
-	if err != nil {
-		slog.Error(fmt.Sprintf("Tally insert error: %v", err))
-		return &constants.AnswerState{
-			State: constants.ErrorState,
-			Data:  "Failed to save tally details",
-			Adv:   "none",
+	if hasSubmissionId {
+		var submissionId any
+		if req.SubmissionId != "" {
+			submissionId = req.SubmissionId
 		}
+		tallyCols += ", submission_id"
+		tallyVals = append(tallyVals, submissionId)
 	}
-
-	// 2. Update vehicle status
-	tallyStQr := `UPDATE manifest_vehicles SET 
-                inspection_status = ?, tallied_status = ?, inspection_time = ?, tallied_time = ?, model = ?
-                WHERE vehicle_id = ?`
-
-	_, err = tx.ExecContext(ctx, tallyStQr, "yes", "yes", req.InspectionTime, req.InspectionTime, req.ModelName, req.VehicleId)
+	_, err = tx.ExecContext(ctx,
+		"INSERT INTO vehicles_talling ("+tallyCols+", tallied_time) VALUES ("+strings.Repeat("?,", len(tallyVals))+"NOW())",
+		tallyVals...)
 	if err != nil {
-		slog.Error(fmt.Sprintf("Status update error: %v", err))
-		return &constants.AnswerState{
-			State: constants.ErrorState,
-			Data:  "Failed to update vehicle status",
-			Adv:   "none",
-		}
+		return fail("Failed to save tally details", err)
 	}
 
-	// 3. Prepare statements for batch operations
+	// 6. Update vehicle status. New inspection data must be published again; a resend
+	// carries the same inspection, so its published flag stays as it is.
+	statusQr := "UPDATE manifest_vehicles SET inspection_status = ?, tallied_status = ?, inspection_time = ?, tallied_time = ?, model = ?"
+	statusVals := []any{"yes", "yes", req.InspectionTime, req.InspectionTime, req.ModelName}
+	if outcome != InspectionSaveResend {
+		statusQr += ", is_published = ?"
+		statusVals = append(statusVals, "no")
+	}
+	statusQr += " WHERE vehicle_id = ?"
+	statusVals = append(statusVals, req.VehicleId)
+
+	if _, err = tx.ExecContext(ctx, statusQr, statusVals...); err != nil {
+		return fail("Failed to update vehicle status", err)
+	}
+
+	// 7. Insert inspections
 	inspStmt, err := tx.PrepareContext(ctx, `
         INSERT INTO vehicles_inspection
-        (inspection_id, vehicle_id, check_id, status, check_time) 
+        (inspection_id, vehicle_id, check_id, status, check_time)
         VALUES (?,?,?,?,NOW())
         ON DUPLICATE KEY UPDATE
 		inspection_id = ?,
@@ -423,59 +526,26 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
         check_time = NOW()
     `)
 	if err != nil {
-		slog.Error(fmt.Sprintf("Inspection statement prep error: %v", err))
-		return &constants.AnswerState{
-			State: constants.ErrorState,
-			Data:  "Failed to prepare inspection statement",
-			Adv:   "none",
-		}
+		return fail("Failed to prepare inspection statement", err)
 	}
 	defer inspStmt.Close()
 
-	// 4. First insert ALL inspections to avoid foreign key issues
 	for _, insp := range inspections {
 		vals := []any{
 			insp.inspId, req.VehicleId, insp.inspection.CheckId, insp.inspection.CheckStatus,
 			insp.inspId, req.VehicleId, insp.inspection.CheckId, insp.inspection.CheckStatus,
 		}
-		_, err := inspStmt.ExecContext(ctx, vals...)
-		if err != nil {
-			slog.Error(fmt.Sprintf("Inspection insert error: %v", err))
-			return &constants.AnswerState{
-				State: constants.ErrorState,
-				Data:  "Failed to save inspection information",
-				Adv:   "none",
-			}
+		if _, err := inspStmt.ExecContext(ctx, vals...); err != nil {
+			return fail("Failed to save inspection information", err)
 		}
 	}
 
-	// commit the transaction here to ensure all inspections are saved before images
-	if err := tx.Commit(); err != nil {
-		slog.Error(fmt.Sprintf("Transaction commit error: %v", err))
-		return &constants.AnswerState{
-			State: constants.ErrorState,
-			Data:  "Failed to commit changes. Please try again.",
-			Adv:   "none",
-		}
-	}
-	// Reopen the transaction to handle images
-	tx, err = db.BeginTx(ctx, &sql.TxOptions{
-		Isolation: sql.LevelReadCommitted,
-	})
-	if err != nil {
-		slog.Error(fmt.Sprintf("Transaction start error: %v", err))
-		return &constants.AnswerState{
-			State: constants.ErrorState,
-			Data:  "Failed to start transaction",
-			Adv:   "none",
-		}
-	}
-
-	// 5. Now prepare and execute image inserts after all inspections are committed
+	// 8. Inspection images. The parent inspections were inserted above in the same
+	// transaction, so the foreign key is satisfied.
 	if hasImages(req.Checks) {
 		inspImgStmt, err := tx.PrepareContext(ctx, `
             INSERT INTO inspection_image
-            (image_id, image_link, inspection_id, creation_time) 
+            (image_id, image_link, inspection_id, creation_time)
             VALUES (?,?,?,NOW())
             ON DUPLICATE KEY UPDATE
             image_link = ?,
@@ -483,12 +553,7 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
             creation_time = NOW()
         `)
 		if err != nil {
-			slog.Error(fmt.Sprintf("Image statement prep error: %v", err))
-			return &constants.AnswerState{
-				State: constants.ErrorState,
-				Data:  "Failed to prepare image statement",
-				Adv:   "none",
-			}
+			return fail("Failed to prepare image statement", err)
 		}
 		defer inspImgStmt.Close()
 
@@ -498,56 +563,33 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 					insp.imgId, insp.inspection.FaultImage, insp.inspId,
 					insp.inspection.FaultImage, insp.inspId,
 				}
-				_, err := inspImgStmt.ExecContext(ctx, vals...)
-				if err != nil {
-					slog.Error(fmt.Sprintf("Image insert error: %v", err))
-					return &constants.AnswerState{
-						State: constants.ErrorState,
-						Data:  "Failed to save image information",
-						Adv:   "none",
-					}
+				if _, err := inspImgStmt.ExecContext(ctx, vals...); err != nil {
+					return fail("Failed to save image information", err)
 				}
 			}
 		}
 	}
 
-	// 6. Handle Onboard packages
+	// 9. Handle Onboard packages
 	if len(packagez) > 0 {
 		// delete existing packages for the vehicle to avoid duplicates, since we are doing a full replace for onboard packages
-		delPkgQr := `DELETE FROM onboard_packages WHERE vehicle_id = ?`
-		_, err := tx.ExecContext(ctx, delPkgQr, req.VehicleId)
-		if err != nil {
-			slog.Error(fmt.Sprintf("Failed to delete existing onboard packages: %v", err))
-			return &constants.AnswerState{
-				State: constants.ErrorState,
-				Data:  "Failed to delete existing onboard packages",
-				Adv:   "none",
-			}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM onboard_packages WHERE vehicle_id = ?`, req.VehicleId); err != nil {
+			return fail("Failed to delete existing onboard packages", err)
 		}
 		packStmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO onboard_packages
-		(package_id, title, remark, vehicle_id) 
+		(package_id, title, remark, vehicle_id)
 		VALUES (?,?,?,?)`)
 		if err != nil {
-			slog.Error(fmt.Sprintf("Failed to create on board package statement: %v", err))
-			return &constants.AnswerState{
-				State: constants.ErrorState,
-				Data:  "Failed to create onboard package statement",
-				Adv:   "none",
-			}
+			return fail("Failed to create onboard package statement", err)
 		}
 		defer packStmt.Close()
 		packMeStmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO onboard_packages_media
-		(media_id, media_type, media_link, package_id) 
+		(media_id, media_type, media_link, package_id)
 		VALUES (?,?,?,?)`)
 		if err != nil {
-			slog.Error(fmt.Sprintf("Failed to create on board package media statement %v", err))
-			return &constants.AnswerState{
-				State: constants.ErrorState,
-				Data:  "Failed to create onboard package media statement",
-				Adv:   "none",
-			}
+			return fail("Failed to create onboard package media statement", err)
 		}
 		defer packMeStmt.Close()
 		for _, pack := range packagez {
@@ -555,15 +597,8 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 			vals := []any{
 				pack.packageId, pack.packageData.Title, pack.packageData.Remark, req.VehicleId,
 			}
-
-			_, err := packStmt.ExecContext(ctx, vals...)
-			if err != nil {
-				slog.Error(fmt.Sprintf("Failed to save on board package information: %v", err))
-				return &constants.AnswerState{
-					State: constants.ErrorState,
-					Data:  "Failed to save on board packege information",
-					Adv:   "none",
-				}
+			if _, err := packStmt.ExecContext(ctx, vals...); err != nil {
+				return fail("Failed to save on board packege information", err)
 			}
 
 			// package media
@@ -571,230 +606,295 @@ func InsertInspectionTallyRemarks(req manifest.InspectionChecksRequest, userId s
 				valsMed := []any{
 					pack.mediaIds[i], pack.packageData.Media[i].MediaType, pack.packageData.Media[i].MediaLink, pack.packageId,
 				}
-
-				_, err := packMeStmt.ExecContext(ctx, valsMed...)
-				if err != nil {
-					slog.Error(fmt.Sprintf("Failed to save onboard package media information: %v", err))
-					return &constants.AnswerState{
-						State: constants.ErrorState,
-						Data:  "Failed to save onboard package media information",
-						Adv:   "none",
-					}
+				if _, err := packMeStmt.ExecContext(ctx, valsMed...); err != nil {
+					return fail("Failed to save onboard package media information", err)
 				}
 			}
 		}
 	}
 
-	// 7. handle remarks if present
-	if len(req.Remarks) > 0 {
-		rmkStmt, err := tx.PrepareContext(ctx, `
-            INSERT INTO inspection_remarks
-            (remark_id, vehicle_id, remark, remark_type, image_link, remark_time) 
-            VALUES (?,?,?,?,?,NOW())
-            ON DUPLICATE KEY UPDATE
-            vehicle_id = ?,
-            remark = ?,
-            image_link = ?,
-            remark_time = NOW()
-        `)
-		if err != nil {
-			slog.Error(fmt.Sprintf("Remarks statement prep error: %v", err))
-			return &constants.AnswerState{
-				State: constants.ErrorState,
-				Data:  "Failed to prepare remarks statement",
-				Adv:   "none",
-			}
-		}
-		defer rmkStmt.Close()
-
-		for i, remark := range req.Remarks {
-			vals := []any{
-				remarkIds[i], req.VehicleId, remark.Remark, remark.RemarkType, remark.RemarkImage,
-				req.VehicleId, remark.Remark, remark.RemarkImage,
-			}
-			_, err := rmkStmt.ExecContext(ctx, vals...)
-			if err != nil {
-				slog.Error(fmt.Sprintf("Remark insert error: %v", err))
-				return &constants.AnswerState{
-					State: constants.ErrorState,
-					Data:  "Failed to save remarks information",
-					Adv:   "none",
-				}
-			}
+	// 10. handle remarks if present
+	for i, remark := range req.Remarks {
+		if err := replaceRemark(ctx, tx, remarkIds[i], req.VehicleId, remark); err != nil {
+			return fail("Failed to save remarks information", err)
 		}
 	}
 
-	// 8. Finally handle media
+	// 11. Finally handle media
 	if len(req.Media) > 0 {
 		// delete existing media for the vehicle to avoid duplicates, since we are doing a full replace for media
-		delMediaQr := `DELETE FROM vehicle_galllery WHERE vehicle_id = ?`
-		_, err := tx.ExecContext(ctx, delMediaQr, req.VehicleId)
-		if err != nil {
-			slog.Error(fmt.Sprintf("Failed to delete existing media: %v", err))
-			return &constants.AnswerState{
-				State: constants.ErrorState,
-				Data:  "Failed to delete existing media",
-				Adv:   "none",
-			}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM vehicle_galllery WHERE vehicle_id = ?`, req.VehicleId); err != nil {
+			return fail("Failed to delete existing media", err)
 		}
 		mediaStmt, err := tx.PrepareContext(ctx, `
 			INSERT INTO vehicle_galllery
-			(media_id, media_link, media_type, remark, vehicle_id, status) 
+			(media_id, media_link, media_type, remark, vehicle_id, status)
 			VALUES (?,?,?,?,?,?)
 		`)
-
 		if err != nil {
-			slog.Error(fmt.Sprintf("Media statement prep error: %v", err))
-			return &constants.AnswerState{
-				State: constants.ErrorState,
-				Data:  "Failed to prepare media statement",
-				Adv:   "none",
-			}
+			return fail("Failed to prepare media statement", err)
 		}
-
 		defer mediaStmt.Close()
 
 		for i, media := range req.Media {
 			vals := []any{
 				mediaIds[i], media.MediaLink, media.MediaType, media.Remark, req.VehicleId, manifest.GenStatus.Active,
 			}
-
-			_, err := mediaStmt.ExecContext(ctx, vals...)
-			if err != nil {
-				slog.Error(fmt.Sprintf("Media insert has failed due to: %v", err))
-				return &constants.AnswerState{
-					State: constants.ErrorState,
-					Data:  "Failed to save vehicle media",
-					Adv:   "none",
-				}
+			if _, err := mediaStmt.ExecContext(ctx, vals...); err != nil {
+				return fail("Failed to save vehicle media", err)
 			}
 		}
 	}
 
 	// Commit transaction
 	if err := tx.Commit(); err != nil {
-		slog.Error(fmt.Sprintf("Transaction commit error: %v", err))
-		return &constants.AnswerState{
-			State: constants.ErrorState,
-			Data:  "Failed to commit changes. Please try again.",
-			Adv:   "none",
-		}
+		return fail("Failed to commit changes. Please try again.", err)
 	}
-
 	committed = true
+
+	if outcome != InspectionSaveNew {
+		slog.Info(fmt.Sprintf("Inspection save for vehicle %s handled as %s", req.VehicleId, outcome))
+	}
 
 	return &constants.AnswerState{
 		State: constants.SuccessState,
 		Data:  "Inspection and tally information were successfully added.",
-		Adv:   "none",
+		Adv:   outcome,
 	}
 }
 
-// archiveVehicleData copies all active inspection records for vehicleId into their
-// respective history tables, then deletes them from the active tables so that a fresh
-// insert can proceed without any ON DUPLICATE KEY UPDATE side-effects.
-//
-// SCHEMA REQUIREMENT: every history table must mirror its active twin column-for-column
-// with one extra column appended at the end:
-//
-//	`archived_at DATETIME NOT NULL`  ← set to NOW() by each INSERT … SELECT *, NOW()
-//
-// Quick DDL recipe per table (repeat for every table listed below):
-//
-//	CREATE TABLE vehicles_talling_history LIKE vehicles_talling;
-//	ALTER TABLE vehicles_talling_history
-//	    ADD COLUMN archived_at DATETIME NOT NULL DEFAULT '1000-01-01 00:00:00',
-//	    DROP PRIMARY KEY,            -- allow multiple historical rows per vehicle
-//	    ADD INDEX idx_vt_hist_vid (vehicle_id),
-//	    ADD INDEX idx_vt_hist_arc (archived_at);
-//
-// Apply the same pattern to:
-//
-//	vehicles_inspection_history, inspection_image_history,
-//	onboard_packages_history, onboard_packages_media_history,
-//	inspection_remarks_history, vehicle_galllery_history
-func archiveVehicleData(ctx context.Context, tx *sql.Tx, vehicleId string) error {
-	// ── INSERT phase: copy rows into history tables ─────────────────────────
-	// Each child table is archived immediately after its parent so the grouping
-	// mirrors the actual parent → child relationship.
+// unknownInspectionReferences lists the maker, body type and check ids of an
+// inspection that do not exist on this server.
+func unknownInspectionReferences(ctx context.Context, tx *sql.Tx, req manifest.InspectionChecksRequest) ([]string, error) {
+	unknown := []string{}
 
-	if _, err := tx.ExecContext(ctx,
-		"INSERT INTO vehicles_inspection_history SELECT *, NOW() FROM vehicles_inspection WHERE vehicle_id = ?",
-		vehicleId); err != nil {
-		return fmt.Errorf("archive vehicles_inspection: %w", err)
+	exists := func(table, column, id string) (bool, error) {
+		var one int
+		err := tx.QueryRowContext(ctx, "SELECT 1 FROM "+table+" WHERE "+column+" = ? LIMIT 1", id).Scan(&one)
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
+		return err == nil, err
 	}
-	// inspection_image_history is a child of vehicles_inspection_history (linked via inspection_id).
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO inspection_image_history
-		SELECT *, NOW() FROM inspection_image
-		WHERE inspection_id IN (
-			SELECT inspection_id FROM vehicles_inspection WHERE vehicle_id = ?
-		)`, vehicleId); err != nil {
-		return fmt.Errorf("archive inspection_image: %w", err)
-	}
-
-	if _, err := tx.ExecContext(ctx,
-		"INSERT INTO onboard_packages_history SELECT *, NOW() FROM onboard_packages WHERE vehicle_id = ?",
-		vehicleId); err != nil {
-		return fmt.Errorf("archive onboard_packages: %w", err)
-	}
-	// onboard_packages_media_history is a child of onboard_packages_history (linked via package_id).
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO onboard_packages_media_history
-		SELECT *, NOW() FROM onboard_packages_media
-		WHERE package_id IN (
-			SELECT package_id FROM onboard_packages WHERE vehicle_id = ?
-		)`, vehicleId); err != nil {
-		return fmt.Errorf("archive onboard_packages_media: %w", err)
-	}
-
-	for _, qr := range [3]string{
-		"INSERT INTO inspection_remarks_history SELECT *, NOW() FROM inspection_remarks WHERE vehicle_id = ?",
-		"INSERT INTO vehicle_galllery_history SELECT *, NOW() FROM vehicle_galllery WHERE vehicle_id = ?",
-		"INSERT INTO vehicles_talling_history SELECT *, NOW() FROM vehicles_talling WHERE vehicle_id = ?",
+	for _, ref := range []struct{ table, column, id, label string }{
+		{"vehicle_makers", "maker_id", req.MakerId, "maker"},
+		{"vehicle_bodies", "body_id", req.BodyId, "body type"},
 	} {
-		if _, err := tx.ExecContext(ctx, qr, vehicleId); err != nil {
-			return fmt.Errorf("archive table: %w", err)
+		ok, err := exists(ref.table, ref.column, ref.id)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			unknown = append(unknown, fmt.Sprintf("%s %q", ref.label, ref.id))
 		}
 	}
 
-	// ── DELETE phase: purge active tables, child before parent ───────────────
-	// Each child is deleted immediately before its parent to satisfy FK constraints.
-
-	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM inspection_image
-		WHERE inspection_id IN (
-			SELECT inspection_id FROM vehicles_inspection WHERE vehicle_id = ?
-		)`, vehicleId); err != nil {
-		return fmt.Errorf("delete inspection_image: %w", err)
+	ids := []any{}
+	seen := map[string]bool{}
+	for _, c := range req.Checks {
+		if !seen[c.CheckId] {
+			seen[c.CheckId] = true
+			ids = append(ids, c.CheckId)
+		}
 	}
+	if len(ids) > 0 {
+		rows, err := tx.QueryContext(ctx,
+			"SELECT check_id FROM inspection_checklist WHERE check_id IN ("+strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")+")",
+			ids...)
+		if err != nil {
+			return nil, err
+		}
+		found := map[string]bool{}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			found[id] = true
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		for _, id := range ids {
+			if !found[id.(string)] {
+				unknown = append(unknown, fmt.Sprintf("check %q", id))
+			}
+		}
+	}
+	return unknown, nil
+}
+
+// replaceRemark writes one remark for a vehicle. inspection_remarks has a
+// UNIQUE (vehicle_id, remark) USING HASH key, and ON DUPLICATE KEY UPDATE does not
+// catch that key on MariaDB (Error 1062 on 'vehicle_id_2'). The row with the same
+// text is therefore deleted first, so a repeated remark text replaces the old one.
+func replaceRemark(ctx context.Context, tx *sql.Tx, remarkId, vehicleId string, remark manifest.RemarkSaveRequest) error {
 	if _, err := tx.ExecContext(ctx,
-		"DELETE FROM vehicles_inspection WHERE vehicle_id = ?", vehicleId); err != nil {
-		return fmt.Errorf("delete vehicles_inspection: %w", err)
+		"DELETE FROM inspection_remarks WHERE vehicle_id = ? AND remark = ?",
+		vehicleId, remark.Remark); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO inspection_remarks
+		(remark_id, vehicle_id, remark, remark_type, image_link, remark_time)
+		VALUES (?,?,?,?,?,NOW())`,
+		remarkId, vehicleId, remark.Remark, remark.RemarkType, remark.RemarkImage)
+	return err
+}
+
+// vehicleDataTables lists every active inspection table with its history twin and the
+// filter that selects one vehicle's rows. Each child table follows its parent.
+var vehicleDataTables = []struct {
+	active  string
+	history string
+	filter  string
+}{
+	{"vehicles_inspection", "vehicles_inspection_history", "vehicle_id = ?"},
+	{"inspection_image", "inspection_image_history", "inspection_id IN (SELECT inspection_id FROM vehicles_inspection WHERE vehicle_id = ?)"},
+	{"onboard_packages", "onboard_packages_history", "vehicle_id = ?"},
+	{"onboard_packages_media", "onboard_packages_media_history", "package_id IN (SELECT package_id FROM onboard_packages WHERE vehicle_id = ?)"},
+	{"inspection_remarks", "inspection_remarks_history", "vehicle_id = ?"},
+	{"vehicle_galllery", "vehicle_galllery_history", "vehicle_id = ?"},
+	{"vehicles_talling", "vehicles_talling_history", "vehicle_id = ?"},
+}
+
+// copyVehicleDataToHistory copies all active inspection records for vehicleId into
+// their history tables as one batch. Every row of the batch gets the same archived_at
+// value, because the timeline matches the history tables on that value.
+//
+// Columns are copied by name (see sharedColumns), never with SELECT *. The old
+// SELECT * copy failed with "Column count doesn't match" and, where the counts
+// happened to match, wrote values into the wrong columns. Every history table needs
+// an `archived_at DATETIME` column.
+func copyVehicleDataToHistory(ctx context.Context, tx *sql.Tx, vehicleId string) error {
+	// archived_at identifies the batch, and it has one-second resolution. Two archives
+	// of the same vehicle within one second would merge into one batch, so the value
+	// is kept strictly increasing per vehicle. The caller holds the vehicle row lock,
+	// so no other save can pick the same value.
+	var archivedAt string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT DATE_FORMAT(GREATEST(NOW(), COALESCE(MAX(archived_at) + INTERVAL 1 SECOND, NOW())), '%Y-%m-%d %H:%i:%s')
+		FROM vehicles_talling_history WHERE vehicle_id = ?`, vehicleId).Scan(&archivedAt); err != nil {
+		return fmt.Errorf("read archive time: %w", err)
 	}
 
-	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM onboard_packages_media
-		WHERE package_id IN (
-			SELECT package_id FROM onboard_packages WHERE vehicle_id = ?
-		)`, vehicleId); err != nil {
-		return fmt.Errorf("delete onboard_packages_media: %w", err)
+	for _, t := range vehicleDataTables {
+		cols, err := sharedColumns(ctx, tx, t.active, t.history)
+		if err != nil {
+			return err
+		}
+		qr := fmt.Sprintf("INSERT INTO %s (%s, archived_at) SELECT %s, ? FROM %s WHERE %s", t.history, cols.insert, cols.sel, t.active, t.filter)
+		if _, err := tx.ExecContext(ctx, qr, archivedAt, vehicleId); err != nil {
+			return fmt.Errorf("archive %s: %w", t.active, err)
+		}
 	}
-	if _, err := tx.ExecContext(ctx,
-		"DELETE FROM onboard_packages WHERE vehicle_id = ?", vehicleId); err != nil {
-		return fmt.Errorf("delete onboard_packages: %w", err)
-	}
+	return nil
+}
 
-	for _, qr := range [3]string{
+// deleteActiveVehicleData removes all active inspection records for vehicleId. Each
+// child table is cleared before its parent to satisfy the foreign keys.
+func deleteActiveVehicleData(ctx context.Context, tx *sql.Tx, vehicleId string) error {
+	for _, qr := range []string{
+		"DELETE FROM inspection_image WHERE inspection_id IN (SELECT inspection_id FROM vehicles_inspection WHERE vehicle_id = ?)",
+		"DELETE FROM vehicles_inspection WHERE vehicle_id = ?",
+		"DELETE FROM onboard_packages_media WHERE package_id IN (SELECT package_id FROM onboard_packages WHERE vehicle_id = ?)",
+		"DELETE FROM onboard_packages WHERE vehicle_id = ?",
 		"DELETE FROM inspection_remarks WHERE vehicle_id = ?",
 		"DELETE FROM vehicle_galllery WHERE vehicle_id = ?",
 		"DELETE FROM vehicles_talling WHERE vehicle_id = ?",
 	} {
 		if _, err := tx.ExecContext(ctx, qr, vehicleId); err != nil {
-			return fmt.Errorf("delete active table: %w", err)
+			return fmt.Errorf("delete active data: %w", err)
 		}
 	}
+	return nil
+}
 
+type archiveColumns struct {
+	insert string // column list for INSERT INTO <history> (...)
+	sel    string // matching expressions for SELECT ... FROM <active>
+}
+
+var archiveColumnsCache sync.Map
+
+// sharedColumns returns the columns to copy from the active table into its history
+// table: every column present in both, in the active table's order. A required
+// history column that the active table lacks is filled from manifest_vehicles when it
+// is manifest_id (older vehicles_talling tables have no manifest_id); any other one is
+// an error. The result is cached for the life of the process.
+func sharedColumns(ctx context.Context, tx *sql.Tx, active, history string) (archiveColumns, error) {
+	if cols, ok := archiveColumnsCache.Load(active); ok {
+		return cols.(archiveColumns), nil
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT h.COLUMN_NAME,
+		       a.COLUMN_NAME IS NOT NULL AS in_active,
+		       h.IS_NULLABLE = 'NO' AND h.COLUMN_DEFAULT IS NULL AS required
+		FROM information_schema.COLUMNS h
+		LEFT JOIN information_schema.COLUMNS a
+		  ON a.TABLE_SCHEMA = h.TABLE_SCHEMA AND a.TABLE_NAME = ? AND a.COLUMN_NAME = h.COLUMN_NAME
+		WHERE h.TABLE_SCHEMA = DATABASE() AND h.TABLE_NAME = ? AND h.COLUMN_NAME <> 'archived_at'
+		ORDER BY h.ORDINAL_POSITION`, active, history)
+	if err != nil {
+		return archiveColumns{}, fmt.Errorf("read columns of %s: %w", history, err)
+	}
+	defer rows.Close()
+
+	insertCols := []string{}
+	selectExprs := []string{}
+	for rows.Next() {
+		var name string
+		var inActive, required bool
+		if err := rows.Scan(&name, &inActive, &required); err != nil {
+			return archiveColumns{}, fmt.Errorf("read columns of %s: %w", history, err)
+		}
+		switch {
+		case inActive:
+			insertCols = append(insertCols, "`"+name+"`")
+			selectExprs = append(selectExprs, "`"+name+"`")
+		case required && name == "manifest_id":
+			insertCols = append(insertCols, "`manifest_id`")
+			selectExprs = append(selectExprs, fmt.Sprintf("(SELECT mv.manifest_id FROM manifest_vehicles mv WHERE mv.vehicle_id = %s.vehicle_id)", active))
+		case required:
+			return archiveColumns{}, fmt.Errorf("history table %s requires column %s, which %s does not have", history, name, active)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return archiveColumns{}, fmt.Errorf("read columns of %s: %w", history, err)
+	}
+	if len(insertCols) == 0 {
+		return archiveColumns{}, fmt.Errorf("history table %s is missing or shares no columns with %s", history, active)
+	}
+
+	cols := archiveColumns{insert: strings.Join(insertCols, ", "), sel: strings.Join(selectExprs, ", ")}
+	archiveColumnsCache.Store(active, cols)
+	return cols, nil
+}
+
+// nullArchiveTime scans a DATETIME such as MAX(archived_at). The DSN does not set
+// parseTime, so the driver returns the value as text, which sql.NullTime cannot scan
+// ("unsupported Scan, storing driver.Value type []uint8 into type *time.Time").
+type nullArchiveTime struct {
+	Time  string
+	Valid bool
+}
+
+func (n *nullArchiveTime) Scan(value any) error {
+	switch v := value.(type) {
+	case nil:
+		n.Time, n.Valid = "", false
+	case []byte:
+		n.Time, n.Valid = string(v), true
+	case string:
+		n.Time, n.Valid = v, true
+	case time.Time:
+		n.Time, n.Valid = v.Format("2006-01-02 15:04:05"), true
+	default:
+		return fmt.Errorf("unsupported archived_at value of type %T", value)
+	}
 	return nil
 }
 
@@ -822,7 +922,6 @@ func InsertPackageInspection(req manifest.PackageInspectionSaveRequest, userId s
 			Adv:   "none",
 		}
 	}
-	defer db.Close()
 
 	// Use ReadCommitted isolation level for better performance while maintaining data integrity
 	tx, err := db.BeginTx(ctx, &sql.TxOptions{
@@ -846,6 +945,30 @@ func InsertPackageInspection(req manifest.PackageInspectionSaveRequest, userId s
 		}
 	}()
 
+	// Lock the package row so saves from several tablets do not interleave, and find
+	// out whether this request changes the stored inspection.
+	var lockedId string
+	err = tx.QueryRowContext(ctx, "SELECT package_id FROM manifest_packages WHERE package_id = ? FOR UPDATE", req.PackageId).Scan(&lockedId)
+	if err == sql.ErrNoRows {
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Package was not found in the manifest", Adv: SaveErrNotFound}
+	}
+	if err != nil {
+		slog.Error(fmt.Sprintf("Package lock error: %v", err))
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to lock package record", Adv: "none"}
+	}
+
+	var oldType, oldPicture, oldStatus, oldTime string
+	changed := true
+	err = tx.QueryRowContext(ctx,
+		"SELECT type_id, picture, inspection_status, DATE_FORMAT(inspection_time, '%Y-%m-%d %H:%i:%s') FROM packages_inspection WHERE package_id = ?",
+		req.PackageId).Scan(&oldType, &oldPicture, &oldStatus, &oldTime)
+	if err == nil {
+		changed = oldType != req.TypeId || oldPicture != req.PackageImage || oldStatus != req.InspectionStatusId || oldTime != req.InspectionTime
+	} else if err != sql.ErrNoRows {
+		slog.Error(fmt.Sprintf("Package inspection read error: %v", err))
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to read package inspection", Adv: "none"}
+	}
+
 	qr := ` INSERT INTO 
 					packages_inspection(inspection_id, package_id, type_id, picture, inspection_status, user_id, inspection_time, creation_time) 
 			VALUES (?,?,?,?,?,?,?,NOW())
@@ -862,7 +985,7 @@ func InsertPackageInspection(req manifest.PackageInspectionSaveRequest, userId s
 		req.TypeId, req.PackageImage, req.InspectionStatusId, userId, req.InspectionTime,
 	}
 
-	inspeStmt, err := tx.PrepareContext(context.Background(), qr)
+	inspeStmt, err := tx.PrepareContext(ctx, qr)
 	if err != nil {
 		slog.Error(fmt.Sprintf("Statement preparation error: %v", err))
 		return &constants.AnswerState{
@@ -873,9 +996,16 @@ func InsertPackageInspection(req manifest.PackageInspectionSaveRequest, userId s
 	}
 	defer inspeStmt.Close()
 
-	_, err = inspeStmt.ExecContext(context.Background(), vals...)
+	_, err = inspeStmt.ExecContext(ctx, vals...)
 	if err != nil {
 		slog.Error(fmt.Sprintf("Statement execution error: %v", err))
+		if invalidReference(err) {
+			return &constants.AnswerState{
+				State: constants.ErrorState,
+				Data:  "The package inspection refers to a package type or status that does not exist on this server",
+				Adv:   SaveErrInvalidReference,
+			}
+		}
 		return &constants.AnswerState{
 			State: constants.ErrorState,
 			Data:  "Failed to execute statement",
@@ -884,8 +1014,13 @@ func InsertPackageInspection(req manifest.PackageInspectionSaveRequest, userId s
 	}
 
 	// udpate package manifest inspection status
+	// A changed inspection has to reach the remote server again.
 	manifestUpdateQr := `UPDATE manifest_packages SET is_inspected = ? WHERE package_id = ?`
-	_, err = tx.ExecContext(ctx, manifestUpdateQr, manifest.InspectionStatus.Yes, req.PackageId)
+	manifestUpdateVals := []any{manifest.InspectionStatus.Yes, req.PackageId}
+	if changed && gendb.ColumnExists("manifest_packages", "is_published") {
+		manifestUpdateQr = `UPDATE manifest_packages SET is_inspected = ?, is_published = 'no' WHERE package_id = ?`
+	}
+	_, err = tx.ExecContext(ctx, manifestUpdateQr, manifestUpdateVals...)
 	if err != nil {
 		slog.Error(fmt.Sprintf("Manifest update error: %v", err))
 		return &constants.AnswerState{
@@ -938,7 +1073,6 @@ func InsertPackageInspection(req manifest.PackageInspectionSaveRequest, userId s
 		}
 	}
 
-	committed = true
 	if err := tx.Commit(); err != nil {
 		slog.Error(fmt.Sprintf("Transaction commit error: %v", err))
 		return &constants.AnswerState{
@@ -947,6 +1081,7 @@ func InsertPackageInspection(req manifest.PackageInspectionSaveRequest, userId s
 			Adv:   "none",
 		}
 	}
+	committed = true
 
 	return &constants.AnswerState{
 		State: constants.SuccessState,
@@ -965,7 +1100,6 @@ func InsertVehicleRemarksOnly(req manifest.VehicleRemarksOnlyRequest, userId str
 		slog.Error(fmt.Sprintf("Database connection error: %v", er))
 		return &constants.AnswerState{State: constants.ErrorState, Data: er.Error(), Adv: "none"}
 	}
-	defer db.Close()
 
 	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
@@ -982,29 +1116,31 @@ func InsertVehicleRemarksOnly(req manifest.VehicleRemarksOnlyRequest, userId str
 		}
 	}()
 
-	rmkStmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO inspection_remarks
-		(remark_id, vehicle_id, remark, remark_type, image_link, remark_time)
-		VALUES (?,?,?,?,?,NOW())
-		ON DUPLICATE KEY UPDATE
-			remark = VALUES(remark),
-			remark_type = VALUES(remark_type),
-			image_link = VALUES(image_link),
-			remark_time = NOW()
-	`)
-	if err != nil {
-		slog.Error(fmt.Sprintf("Remarks statement prep error: %v", err))
-		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to prepare remarks statement", Adv: "none"}
+	// Lock the vehicle row so remarks-only saves and full saves do not interleave.
+	var lockedId string
+	err = tx.QueryRowContext(ctx, "SELECT vehicle_id FROM manifest_vehicles WHERE vehicle_id = ? FOR UPDATE", req.VehicleId).Scan(&lockedId)
+	if err == sql.ErrNoRows {
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Vehicle was not found in the manifest", Adv: SaveErrNotFound}
 	}
-	defer rmkStmt.Close()
+	if err != nil {
+		slog.Error(fmt.Sprintf("Vehicle lock error: %v", err))
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to lock vehicle record", Adv: "none"}
+	}
 
+	// A remark with the same text replaces the old one, so a resend from the tablet
+	// does not fail on the (vehicle_id, remark) unique key.
 	for _, remark := range req.Remarks {
 		remarkId := specials.RandomString(36, "_RMK")
-		_, err := rmkStmt.ExecContext(ctx, remarkId, req.VehicleId, remark.Remark, remark.RemarkType, remark.RemarkImage)
-		if err != nil {
+		if err := replaceRemark(ctx, tx, remarkId, req.VehicleId, remark); err != nil {
 			slog.Error(fmt.Sprintf("Remark insert error: %v", err))
 			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to save remark information", Adv: "none"}
 		}
+	}
+
+	// The new remarks have to reach the remote server on the next publish.
+	if _, err := tx.ExecContext(ctx, "UPDATE manifest_vehicles SET is_published = ? WHERE vehicle_id = ?", "no", req.VehicleId); err != nil {
+		slog.Error(fmt.Sprintf("Publish status reset error: %v", err))
+		return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to update vehicle status", Adv: "none"}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -1046,7 +1182,6 @@ func FixMistakenVehicleIdentification(wrongVehicleId string, correctVehicleId st
 		slog.Error(fmt.Sprintf("Database connection error: %v", er))
 		return &constants.AnswerState{State: constants.ErrorState, Data: er.Error(), Adv: "none"}
 	}
-	defer db.Close()
 
 	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
@@ -1092,7 +1227,7 @@ func FixMistakenVehicleIdentification(wrongVehicleId string, correctVehicleId st
 	// ── Step 3: Check for a prior archive batch on the wrong vehicle ───────────
 	// The archive block in InsertInspectionTallyRemarks stamps every archived row
 	// with NOW() at the time of archival. We use the MAX per table as the batch key.
-	var tallyArchivedAt sql.NullTime
+	var tallyArchivedAt nullArchiveTime
 	if err = tx.QueryRowContext(ctx,
 		"SELECT MAX(archived_at) FROM vehicles_talling_history WHERE vehicle_id = ?",
 		wrongVehicleId).Scan(&tallyArchivedAt); err != nil {
@@ -1116,7 +1251,7 @@ func FixMistakenVehicleIdentification(wrongVehicleId string, correctVehicleId st
 		}
 
 		// 4b. Restore vehicles_inspection (use its own MAX to be precise)
-		var inspArchivedAt sql.NullTime
+		var inspArchivedAt nullArchiveTime
 		if err = tx.QueryRowContext(ctx,
 			"SELECT MAX(archived_at) FROM vehicles_inspection_history WHERE vehicle_id = ?",
 			wrongVehicleId).Scan(&inspArchivedAt); err != nil {
@@ -1168,7 +1303,7 @@ func FixMistakenVehicleIdentification(wrongVehicleId string, correctVehicleId st
 		}
 
 		// 4d. Restore onboard_packages (use its own MAX)
-		var packArchivedAt sql.NullTime
+		var packArchivedAt nullArchiveTime
 		if err = tx.QueryRowContext(ctx,
 			"SELECT MAX(archived_at) FROM onboard_packages_history WHERE vehicle_id = ?",
 			wrongVehicleId).Scan(&packArchivedAt); err != nil {
@@ -1220,7 +1355,7 @@ func FixMistakenVehicleIdentification(wrongVehicleId string, correctVehicleId st
 		}
 
 		// 4f. Restore inspection_remarks
-		var rmkArchivedAt sql.NullTime
+		var rmkArchivedAt nullArchiveTime
 		if err = tx.QueryRowContext(ctx,
 			"SELECT MAX(archived_at) FROM inspection_remarks_history WHERE vehicle_id = ?",
 			wrongVehicleId).Scan(&rmkArchivedAt); err != nil {
@@ -1247,7 +1382,7 @@ func FixMistakenVehicleIdentification(wrongVehicleId string, correctVehicleId st
 		}
 
 		// 4g. Restore vehicle_galllery (preserving the intentional triple-l spelling)
-		var galleryArchivedAt sql.NullTime
+		var galleryArchivedAt nullArchiveTime
 		if err = tx.QueryRowContext(ctx,
 			"SELECT MAX(archived_at) FROM vehicle_galllery_history WHERE vehicle_id = ?",
 			wrongVehicleId).Scan(&galleryArchivedAt); err != nil {
@@ -1295,7 +1430,7 @@ func FixMistakenVehicleIdentification(wrongVehicleId string, correctVehicleId st
 			UPDATE manifest_vehicles SET
 			    inspection_status = 'no',
 			    tallied_status    = 'no',
-			    ispection_time    = '1000-01-01 00:00:00',
+			    inspection_time   = '1000-01-01 00:00:00',
 			    tallied_time      = '1000-01-01 00:00:00'
 			WHERE vehicle_id = ?`, wrongVehicleId); err != nil {
 			slog.Error(fmt.Sprintf("Status reset (wrong vehicle) error: %v", err))
@@ -1345,7 +1480,6 @@ func TransferVehicleData(sourceVehicleId, targetVehicleId, dataSource string) *c
 		slog.Error(fmt.Sprintf("Database connection error: %s", er.Error()))
 		return &constants.AnswerState{State: constants.ErrorState, Data: er.Error(), Adv: "none"}
 	}
-	defer db.Close()
 
 	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
@@ -1379,7 +1513,7 @@ func TransferVehicleData(sourceVehicleId, targetVehicleId, dataSource string) *c
 			if _, err = tx.ExecContext(ctx,
 				"UPDATE "+tbl+" SET vehicle_id = ? WHERE vehicle_id = ?",
 				targetVehicleId, sourceVehicleId); err != nil {
-				slog.Error("Transfer active %s error: %v", tbl, err)
+				slog.Error(fmt.Sprintf("Transfer active %s error: %v", tbl, err))
 				return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to transfer active records", Adv: "none"}
 			}
 		}
@@ -1390,7 +1524,7 @@ func TransferVehicleData(sourceVehicleId, targetVehicleId, dataSource string) *c
 	// inspection_image and onboard_packages_media carry no vehicle_id, so they are
 	// copied verbatim using the same inspection_id / package_id values.
 	case "history":
-		var tallyAt sql.NullTime
+		var tallyAt nullArchiveTime
 		if err = tx.QueryRowContext(ctx,
 			"SELECT MAX(archived_at) FROM vehicles_talling_history WHERE vehicle_id = ?",
 			sourceVehicleId).Scan(&tallyAt); err != nil {
@@ -1412,7 +1546,7 @@ func TransferVehicleData(sourceVehicleId, targetVehicleId, dataSource string) *c
 			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to restore tally record", Adv: "none"}
 		}
 
-		var inspAt sql.NullTime
+		var inspAt nullArchiveTime
 		if err = tx.QueryRowContext(ctx,
 			"SELECT MAX(archived_at) FROM vehicles_inspection_history WHERE vehicle_id = ?",
 			sourceVehicleId).Scan(&inspAt); err != nil {
@@ -1444,7 +1578,7 @@ func TransferVehicleData(sourceVehicleId, targetVehicleId, dataSource string) *c
 			}
 		}
 
-		var packAt sql.NullTime
+		var packAt nullArchiveTime
 		if err = tx.QueryRowContext(ctx,
 			"SELECT MAX(archived_at) FROM onboard_packages_history WHERE vehicle_id = ?",
 			sourceVehicleId).Scan(&packAt); err != nil {
@@ -1476,7 +1610,7 @@ func TransferVehicleData(sourceVehicleId, targetVehicleId, dataSource string) *c
 			}
 		}
 
-		var rmkAt sql.NullTime
+		var rmkAt nullArchiveTime
 		if err = tx.QueryRowContext(ctx,
 			"SELECT MAX(archived_at) FROM inspection_remarks_history WHERE vehicle_id = ?",
 			sourceVehicleId).Scan(&rmkAt); err != nil {
@@ -1496,7 +1630,7 @@ func TransferVehicleData(sourceVehicleId, targetVehicleId, dataSource string) *c
 			}
 		}
 
-		var gallAt sql.NullTime
+		var gallAt nullArchiveTime
 		if err = tx.QueryRowContext(ctx,
 			"SELECT MAX(archived_at) FROM vehicle_galllery_history WHERE vehicle_id = ?",
 			sourceVehicleId).Scan(&gallAt); err != nil {
@@ -1551,7 +1685,7 @@ func TransferVehicleData(sourceVehicleId, targetVehicleId, dataSource string) *c
 		"vehicles_talling_history",
 	} {
 		if _, err = tx.ExecContext(ctx, "DELETE FROM "+tbl+" WHERE vehicle_id = ?", sourceVehicleId); err != nil {
-			slog.Error("Purge %s error: %s", tbl, err.Error())
+			slog.Error(fmt.Sprintf("Purge %s error: %s", tbl, err.Error()))
 			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to purge history records", Adv: "none"}
 		}
 	}
@@ -1564,7 +1698,7 @@ func TransferVehicleData(sourceVehicleId, targetVehicleId, dataSource string) *c
 			UPDATE manifest_vehicles SET
 			    inspection_status = 'no',
 			    tallied_status    = 'no',
-			    ispection_time    = '1000-01-01 00:00:00',
+			    inspection_time   = '1000-01-01 00:00:00',
 			    tallied_time      = '1000-01-01 00:00:00'
 			WHERE vehicle_id = ?`, sourceVehicleId); err != nil {
 			slog.Error(fmt.Sprintf("Status reset (source) error: %s", err.Error()))

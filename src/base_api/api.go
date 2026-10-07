@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	baseapi "github.com/shabs76/roro-local-server/constants/modules/base_api"
 )
@@ -17,10 +18,17 @@ type API struct {
 	Client  *http.Client
 }
 
+// Shared clients reuse connections to the remote server. Without a timeout one
+// stalled request used to hang a whole publish run.
+var (
+	jsonClient = &http.Client{Timeout: 60 * time.Second}
+	fileClient = &http.Client{Timeout: 5 * time.Minute}
+)
+
 func NewAPI(baseURL string) *API {
 	return &API{
 		BaseURL: baseURL,
-		Client:  &http.Client{},
+		Client:  jsonClient,
 	}
 }
 
@@ -225,5 +233,6 @@ func (a *API) SendFile(path string, filePath string, fileParamName string, extra
 	copy(reqHeaders, headers)
 	reqHeaders = append(reqHeaders, baseapi.Header{Key: "Content-Type", Value: writer.FormDataContentType()})
 
-	return a.Post(path, body, target, reqHeaders)
+	uploader := &API{BaseURL: a.BaseURL, Client: fileClient}
+	return uploader.Post(path, body, target, reqHeaders)
 }

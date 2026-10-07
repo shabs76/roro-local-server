@@ -44,6 +44,12 @@ type InspectionChecksRequest struct {
 	Remarks        []RemarkSaveRequest        `json:"remarks" binding:"required"`
 	Media          []VehicleExtraMediaRequest `json:"media" binding:"required"`
 	Packages       []OnBoardPackageRequest    `json:"onBoardPackage" binding:"required"`
+	// SubmissionId is generated once by the tablet per inspection and reused on every
+	// retry, so the server can tell a resend from a new inspection.
+	SubmissionId string `json:"submissionId,omitempty"`
+	// Reinspect must be true to replace an inspection that already exists. Nil keeps
+	// the old behaviour for app builds that do not send it.
+	Reinspect *bool `json:"reinspect,omitempty"`
 }
 
 type AddVehicleRequest struct {

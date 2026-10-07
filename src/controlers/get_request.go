@@ -784,36 +784,39 @@ func enrichVehicleDetails(vehicles []manifest.VehicleData) []manifest.VehiclesDe
 		return vhShow
 	}
 
+	ids := make([]string, len(vehicles))
 	for i := range vehicles {
-		sti, insps := manifestdataservices.SelectInspectionDetails(" `vehicle_id` = ? AND (`status` = ? OR `status` = ?) ", []any{vehicles[i].VehicleId, manifest.InspectionMarkStatus.Damaged, manifest.InspectionMarkStatus.Missing})
-		if sti.State != constants.SuccessState {
-			slog.Error(sti.Data)
-		}
+		ids[i] = vehicles[i].VehicleId
+	}
+	ste, extras := manifestdataservices.SelectVehicleListExtras(ids)
+	if ste.State != constants.SuccessState {
+		slog.Error(ste.Data)
+	}
 
-		str, remarks := manifestdataservices.SelectInspectionRemarks(" `vehicle_id` = ? AND remark_type = ?", []any{vehicles[i].VehicleId, manifest.RemarkStatus.Damaged})
-		if str.State != constants.SuccessState {
-			slog.Error(str.Data)
-		}
-
+	for i := range vehicles {
 		maker := "notset"
 		body := "notset"
 		deck := "notset"
 		image := ""
 		damaged := "no"
 		numberOfKeys := 0
+		inspectedBy := ""
+		inspectionCount := 0
 
-		if len(remarks) > 0 || len(insps) > 0 {
-			damaged = "yes"
-		}
-		stt, tallyDets := manifestdataservices.SelectTallyDetailsLong(" `vehicle_id` = ? ", []any{vehicles[i].VehicleId})
-		if stt.State != constants.SuccessState {
-			slog.Error(stt.Data)
-		} else if len(tallyDets) > 0 {
-			maker = tallyDets[0].MakerName
-			body = tallyDets[0].BodyName
-			deck = tallyDets[0].DeckNumber
-			image = tallyDets[0].VehicleImage
-			numberOfKeys = tallyDets[0].NumberOfKeys
+		if e := extras[vehicles[i].VehicleId]; e != nil {
+			if e.HasActiveTally {
+				maker = e.Maker
+				body = e.BodyType
+				deck = e.DeckNumber
+				image = e.Image
+				numberOfKeys = e.NumberOfKeys
+				inspectedBy = e.InspectedBy
+				inspectionCount = 1
+			}
+			if e.IsDamaged {
+				damaged = "yes"
+			}
+			inspectionCount += e.HistoryBatches
 		}
 
 		vhShow = append(vhShow, manifest.VehiclesDetailsToShow{
@@ -838,6 +841,9 @@ func enrichVehicleDetails(vehicles []manifest.VehicleData) []manifest.VehiclesDe
 			DeckNumber:       deck,
 			IsDamaged:        damaged,
 			NumberOfKeys:     numberOfKeys,
+			IsPublished:      vehicles[i].IsPublished,
+			InspectedBy:      inspectedBy,
+			InspectionCount:  inspectionCount,
 		})
 	}
 	return vhShow
@@ -1134,7 +1140,7 @@ func GetVehicleShortInfo(c *gin.Context) {
 			mainImage = tallyDets[0].VehicleImage
 		}
 
-		if vehicle.InspectionStatus == "yes" {
+		if vehicle.InspectionStatus == "yes" && len(tallyDets) > 0 {
 			stu, users := usersdataservices.SelectUserDetailsWithRolesPass(" `user_id` = ? ", []any{tallyDets[0].UserId})
 			if stu.State == constants.SuccessState && len(users) > 0 {
 				inspectedBy = users[0].FName + " " + users[0].LName
@@ -2000,7 +2006,7 @@ func GetVehicleWithMultipleInspections(c *gin.Context) {
 		}
 	}
 
-	subQr := " `manifest_id` = ? AND `vehicle_id` IN (SELECT DISTINCT vehicle_id FROM `vehicles_talling_history`) "
+	subQr := " `manifest_id` = ? AND EXISTS (SELECT 1 FROM `vehicles_talling_history` h WHERE h.`vehicle_id` = `manifest_vehicles`.`vehicle_id`) "
 	vals := []any{manifestId}
 
 	if searchQuery := c.Query("query"); searchQuery != "" {
