@@ -24,6 +24,11 @@ FROM alpine:latest
 RUN apk add --no-cache ffmpeg libwebp tzdata ca-certificates
 COPY --from=0 /app/main /usr/bin/main
 
+# The server keeps photos in media_data/ and logs in logs/, both relative to the
+# working directory. docker-compose.yml mounts them under /app/src so they survive
+# container rebuilds.
+WORKDIR /app/src
+
 # Expose the port your application will run on
 EXPOSE 4400
 

@@ -1,0 +1,10 @@
+# Keep the build context small: photos, logs, secrets and git history are never
+# needed to build the server image.
+.git
+**/.env
+src/media_data
+src/logs
+src/roro-local-server
+roro_local.sql
+db_scripts
+docs

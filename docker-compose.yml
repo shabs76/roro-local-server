@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   db:
     image: mariadb:10.6
@@ -7,6 +5,9 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      # Same clock as the app, so times written by MariaDB (NOW()) and by the server match.
+      - TZ=${TZ:-Africa/Dar_es_Salaam}
     volumes:
       # Persist database data across container restarts
       - db_data:/var/lib/mysql
@@ -14,12 +15,16 @@ services:
       # db_data volume). Later starts keep the existing data and skip this file.
       - ./roro_local.sql:/docker-entrypoint-initdb.d/01_roro_local.sql:ro
     ports:
-      - "3306:3306"
+      # Reachable from this machine only. Tablets talk to the app on port 4400, never to
+      # the database, and Docker-published ports are not covered by the host firewall.
+      - "127.0.0.1:3306:3306"
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      # Passes once MariaDB accepts TCP connections. On the first start that happens only
+      # after roro_local.sql has been loaded.
+      test: ["CMD", "healthcheck.sh", "--connect"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 30
 
   phpmyadmin:
     image: phpmyadmin:latest
@@ -49,11 +54,16 @@ services:
     environment:
       # Override the DB host from src/.env because in docker the database is reachable via 'db' instead of 'localhost'
       - MYSQL_HOST=db
+      - MYSQL_PORT=3306
+      - TZ=${TZ:-Africa/Dar_es_Salaam}
     volumes:
-      # Keep the media files synchronized/persisted
+      # Photos, videos and documents the tablets upload
       - ./src/media_data:/app/src/media_data
+      # server.log, rotated by the server
+      - ./src/logs:/app/src/logs
     depends_on:
-      - db
+      db:
+        condition: service_healthy
 
 volumes:
   db_data:
