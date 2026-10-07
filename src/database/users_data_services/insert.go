@@ -2,6 +2,7 @@ package usersdataservices
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/shabs76/roro-local-server/constants"
 	"github.com/shabs76/roro-local-server/constants/modules/users"
@@ -27,10 +28,20 @@ func InsertUserRole(roles []users.UserRole) (st *constants.AnswerState) {
 	return &constants.AnswerState{State: constants.SuccessState, Data: fmt.Sprintf("%d roles were successfully synced", len(roles)), Adv: "nothing"}
 }
 
-func InsertUserData(users []users.UserData) (st *constants.AnswerState) {
+// InsertUserData upserts users. The remote roles list holds only roles numbered above
+// 100, but users of the other roles come in the users list too, so each user's role
+// is added from the user record when it is not here yet (users.role is a foreign key
+// to roles). A user that cannot be saved is reported and skipped; the others are still
+// saved.
+func InsertUserData(list []users.UserData) (st *constants.AnswerState) {
+	roleQr := "INSERT INTO `roles`(`role_id`, `role_name`, `role_number`, `role_date`) VALUES (?,?,?,NOW()) ON DUPLICATE KEY UPDATE `role_id`=`role_id`"
 	qr := "INSERT INTO `users`(`user_id`, `fname`, `lname`, `email`, `phone`, `password`, `role`, `status`, `creation_date`) VALUES (?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE `fname`=VALUES(`fname`), `lname`=VALUES(`lname`), `email`=VALUES(`email`), `phone`=VALUES(`phone`), `password`=VALUES(`password`), `role`=VALUES(`role`), `status`=VALUES(`status`), `creation_date`=VALUES(`creation_date`)"
 
-	for _, user := range users {
+	failed := []string{}
+	for _, user := range list {
+		if user.RoleID != "" {
+			gendb.SaveGeneral(roleQr, []any{user.RoleID, user.RoleName, user.RoleNumber})
+		}
 		vals := []any{
 			user.UserID,
 			user.FName,
@@ -42,13 +53,18 @@ func InsertUserData(users []users.UserData) (st *constants.AnswerState) {
 			user.Status,
 			user.CreationDate,
 		}
-		stx := gendb.SaveGeneral(qr, vals)
-		if stx.State != constants.SuccessState {
-			return stx
+		if stx := gendb.SaveGeneral(qr, vals); stx.State != constants.SuccessState {
+			failed = append(failed, fmt.Sprintf("%s (role %s)", user.Email, user.RoleName))
 		}
 	}
 
-	return &constants.AnswerState{State: constants.SuccessState, Data: fmt.Sprintf("%d users were successfully synced", len(users)), Adv: "nothing"}
+	if len(failed) > 0 && len(failed) == len(list) {
+		return &constants.AnswerState{State: constants.ErrorState, Data: fmt.Sprintf("none of the %d users could be saved: %s", len(list), strings.Join(failed, ", ")), Adv: "none"}
+	}
+	if len(failed) > 0 {
+		return &constants.AnswerState{State: constants.SuccessState, Data: fmt.Sprintf("%d of %d users synced; not saved: %s", len(list)-len(failed), len(list), strings.Join(failed, ", ")), Adv: "partial"}
+	}
+	return &constants.AnswerState{State: constants.SuccessState, Data: fmt.Sprintf("%d users were successfully synced", len(list)), Adv: "nothing"}
 }
 
 func UserlonginsData(logs []users.UserLoginResponse) (st *constants.AnswerState) {

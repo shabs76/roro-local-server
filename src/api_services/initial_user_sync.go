@@ -43,8 +43,8 @@ func RemoteLogin(req users.LoginRequest) (users.UserLoginResponse, error) {
 
 // SyncFromRemoteAtStart signs in to the remote server as the initial user and pulls
 // the roles, the users and the reference lists, so that people can log in to a
-// freshly installed local server. Login on this server checks the password against
-// the local users table, and the users table is filled only from the remote server.
+// freshly installed local server. Users are filled only from the remote server: by
+// this pull, and by each login the remote server accepts (see SaveSignedInUser).
 //
 // The initial user's remote credentials come from INIT_USER_EMAIL and
 // INIT_USER_PASSWORD. The pull runs on every start (so new staff and changed
@@ -87,15 +87,48 @@ func SyncFromRemoteAtStart(ctx context.Context) {
 	}
 }
 
-// pullUsersAndLists does one sign-in and pull. Roles and users are required (users
-// reference roles); the reference lists are pulled on a best-effort basis.
+// SaveSignedInUser stores the user the remote server has just signed in, with a hash
+// of the password it accepted. The remote users list never includes the user who asks
+// for it, so this is how the initial user gets here; it also brings in staff added
+// after the last pull, and password changes.
+func SaveSignedInUser(session users.UserLoginResponse, password string) error {
+	hash, err := specials.GeneratePasswordHash(password)
+	if err != nil {
+		return fmt.Errorf("could not hash the password: %w", err)
+	}
+	u := session.User
+	st := usersdataservices.InsertUserData([]users.UserData{{
+		UserID:       u.UserID,
+		FName:        u.FName,
+		LName:        u.LName,
+		Email:        u.Email,
+		Phone:        u.Phone,
+		Password:     hash,
+		RoleID:       u.RoleID,
+		RoleName:     u.RoleName,
+		RoleNumber:   u.RoleNumber,
+		Status:       u.Status,
+		CreationDate: u.CreationDate,
+	}})
+	if st.State != constants.SuccessState {
+		return fmt.Errorf("could not save user %s: %s", u.Email, st.Data)
+	}
+	return nil
+}
+
+// pullUsersAndLists does one sign-in and pull. The users are required; the roles list
+// and the reference lists are pulled on a best-effort basis (the users sync adds every
+// role its users need).
 func pullUsersAndLists(email, password string) error {
 	session, err := RemoteLogin(users.LoginRequest{Email: email, Password: password})
 	if err != nil {
 		return err
 	}
 	if err := FetchUserRoles(session.LoginID, session.LoginKey); err != nil {
-		return fmt.Errorf("roles: %w", err)
+		slog.Warn("Initial user sync: could not pull the roles list; roles come with the users instead", "error", err)
+	}
+	if err := SaveSignedInUser(session, password); err != nil {
+		return fmt.Errorf("initial user: %w", err)
 	}
 	if err := FetchUsersList(session.LoginID, session.LoginKey); err != nil {
 		return fmt.Errorf("users: %w", err)
@@ -103,7 +136,7 @@ func pullUsersAndLists(email, password string) error {
 
 	st, found := usersdataservices.SelectUserDetailsWithRolesPass(" `email` = ? ", []any{email})
 	if st.State != constants.SuccessState || len(found) == 0 {
-		return fmt.Errorf("users were pulled, but the initial user %s is not among them", email)
+		return fmt.Errorf("the initial user %s is missing after the pull", email)
 	}
 	slog.Info("Initial user sync: roles and users pulled from the remote server", "initialUser", email)
 

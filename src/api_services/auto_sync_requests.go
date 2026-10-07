@@ -2,6 +2,7 @@ package apiservices
 
 import (
 	"fmt"
+	"log/slog"
 	"net/http"
 
 	"github.com/shabs76/roro-local-server/base_api"
@@ -100,9 +101,10 @@ func FetchUserRoles(logId, logKey string) error {
 		return fmt.Errorf("failed to fetch user roles: %s", resp.Message)
 	}
 
-	// check if data is empty
+	// The list holds only roles numbered above 100. It can be empty: the users sync adds
+	// every role its users need.
 	if len(userRolesResponse.Data) == 0 {
-		return fmt.Errorf("no user roles found on remote server")
+		return nil
 	}
 
 	// add data to local database
@@ -142,15 +144,19 @@ func FetchUsersList(logId, logKey string) error {
 		return fmt.Errorf("failed to fetch users: %s", resp.Message)
 	}
 
-	// check if data is empty
+	// The list leaves out the user who asks for it, so a company with one user gets an
+	// empty list.
 	if len(usersResponse.Data) == 0 {
-		return fmt.Errorf("no users found on remote server")
+		return nil
 	}
 
 	// add data to local database
 	st := usersdataservices.InsertUserData(usersResponse.Data)
 	if st.State != constants.SuccessState {
 		return fmt.Errorf("failed to insert users into local database: %s", st.Data)
+	}
+	if st.Adv == "partial" {
+		slog.Warn("Some users from the remote server could not be saved", "detail", st.Data)
 	}
 
 	return nil

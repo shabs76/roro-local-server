@@ -29,6 +29,11 @@ func SaveGeneral(sq string, vals []any) *constants.AnswerState {
 		}
 	}
 
+	// The pool is shared and long-lived, so an unclosed statement stays prepared on the
+	// server until its connection closes; bulk list syncs would hit
+	// max_prepared_stmt_count.
+	defer stmt.Close()
+
 	_, erE := stmt.Exec(vals...)
 	if erE != nil {
 		slog.Error(erE.Error())

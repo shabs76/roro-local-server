@@ -344,7 +344,7 @@ On each tablet, in the Walls app login screen:
 
 The local server checks the password, then confirms the login with the remote server. **Logins therefore need internet on the Pi.** Once logged in, inspections and publishing to the local server work without internet.
 
-Staff added on the remote server after the server started are pulled at the next start. Run `docker compose restart app` to pull them at once.
+Staff added on the remote server later, and changed passwords, work at once: the server stores the user when the remote server accepts the login.
 
 ## 11. Daily operation
 
@@ -500,7 +500,7 @@ The next start loads `roro_local.sql` again and pulls users as in step 8.
 | `exec format error` | The 32-bit system is installed. Reinstall with Raspberry Pi OS Lite (64-bit). |
 | `roro-mariadb` is not `healthy`; `roro_app` stays `Created` | The server waits for the database. Run `docker compose logs db`. `password option is not specified` means `.env` is missing or incomplete. |
 | App log repeats `Waiting for database before running migrations` with `Access denied for user 'roro'` | `MYSQL_PASS` in `src/.env` differs from `MYSQL_PASSWORD` in `.env`. Put back the password used at the first start, then run `docker compose up -d --force-recreate app`. A later change in `.env` does not change the database account. |
-| Tablet login says `Invalid email or password` for a valid account | The user was added on the remote server after the last start. Run `docker compose restart app`, wait a minute, and try again. |
+| Tablet login says `Invalid email or password` for a valid account | The remote server refused the login. Check the account on the remote server: it must be active, and the password must be the current one. |
 | Tablet login fails with `failed to login to the remote server` | The Pi has no internet, or its clock is wrong (step 4). |
 | Tablets cannot reach the server | Check that the tablet uses the same network as the Pi. Open `http://192.168.1.50:4400/health` in the tablet's browser. Check that the Pi kept its address (`hostname -I`) and that the address in the app has no slash at the end. |
 | Slow or failing uploads | Run `vcgencmd get_throttled` (step 11) and `df -h /`. A full disk or under-voltage causes both. |

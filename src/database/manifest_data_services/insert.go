@@ -140,6 +140,10 @@ func InsertManifestDetails(data []manifest.ManifestData) (st *constants.AnswerSt
 			detail.ReceivedDate,
 			detail.UploadedDate,
 		}
+		if err := ensureClient(detail.ClientId, detail.ClientName); err != nil {
+			slog.Error("Could not add the manifest's client", "manifestId", detail.ManifestId, "clientId", detail.ClientId, "error", err)
+			return &constants.AnswerState{State: constants.ErrorState, Data: "the manifest's client could not be added: " + err.Error(), Adv: "none"}
+		}
 		stx := gendb.SaveGeneral(qr, vals)
 		if stx.State != constants.SuccessState {
 			return stx
@@ -148,6 +152,42 @@ func InsertManifestDetails(data []manifest.ManifestData) (st *constants.AnswerSt
 	}
 
 	return &constants.AnswerState{State: constants.SuccessState, Data: "Manifest details were successfully synced", Adv: "none"}
+}
+
+// ensureClient adds the manifest's client when it is not here yet (manifest.client_id
+// is a foreign key to clients). The remote client list holds only active clients, so a
+// manifest of an inactive client would otherwise fail. The row holds what the manifest
+// knows; a later client list sync fills in the rest. client_name is unique, so when
+// another client already uses the name, the id is added to it.
+func ensureClient(clientId, clientName string) error {
+	db, err := gendb.InitDb()
+	if err != nil {
+		return err
+	}
+	exists := func() (bool, error) {
+		var n int
+		err := db.QueryRow("SELECT COUNT(*) FROM clients WHERE client_id = ?", clientId).Scan(&n)
+		return n > 0, err
+	}
+	if ok, err := exists(); err != nil || ok {
+		return err
+	}
+	name := strings.TrimSpace(clientName)
+	if name == "" {
+		name = clientId
+	}
+	for _, candidate := range []string{name, name + " (" + clientId + ")"} {
+		if len(candidate) > 100 {
+			candidate = candidate[:100]
+		}
+		if _, err := db.Exec("INSERT INTO clients (client_id, client_name, principal, client_location, creation_date) VALUES (?,?,'','',NOW()) ON DUPLICATE KEY UPDATE client_id = client_id", clientId, candidate); err != nil {
+			return err
+		}
+		if ok, err := exists(); err != nil || ok {
+			return err
+		}
+	}
+	return fmt.Errorf("client %s could not be added: its name is already used by another client", clientId)
 }
 
 func InsertDeckStowagePlanDetails(data []manifest.DeckStowagePlanDetails) (st *constants.AnswerState) {

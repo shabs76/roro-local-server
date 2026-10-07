@@ -39,29 +39,10 @@ func LoginUser(c *gin.Context) {
 		return
 	}
 
-	if len(usersList) == 0 {
-		c.JSON(http.StatusUnauthorized, constants.NormalResponse{
-			State:   constants.ErrorState,
-			Data:    "Invalid email or password",
-			Message: "Authentication failed",
-			Adv:     "none",
-		})
-		return
-	}
-
-	// check if password matches
-	if !specials.ComparePasswordHash(req.Password, usersList[0].Password) {
-		c.JSON(
-			http.StatusUnauthorized,
-			constants.NormalResponse{
-				State:   constants.ErrorState,
-				Data:    "Invalid email or password",
-				Message: "Authentication failed",
-				Adv:     "none",
-			},
-		)
-		return
-	}
+	// The remote server decides. A user missing here (added after the last pull, or
+	// left out of the remote users list) or whose password changed on the remote server
+	// is stored once the remote server accepts the login.
+	knownHere := len(usersList) > 0 && specials.ComparePasswordHash(req.Password, usersList[0].Password)
 
 	// send login request to remote server
 	logRespo, err := apiservices.RemoteLogin(req)
@@ -70,7 +51,7 @@ func LoginUser(c *gin.Context) {
 		if errors.Is(err, apiservices.ErrRemoteLoginRefused) {
 			c.JSON(http.StatusUnauthorized, constants.NormalResponse{
 				State:   constants.ErrorState,
-				Data:    err.Error(),
+				Data:    "Invalid email or password",
 				Message: "Authentication failed",
 				Adv:     "none",
 			})
@@ -83,6 +64,19 @@ func LoginUser(c *gin.Context) {
 			Adv:     "none",
 		})
 		return
+	}
+
+	if !knownHere {
+		if err := apiservices.SaveSignedInUser(logRespo, req.Password); err != nil {
+			slog.Error("Login accepted by the remote server, but the user could not be stored", "email", req.Email, "error", err)
+			c.JSON(http.StatusInternalServerError, constants.NormalResponse{
+				State:   constants.ErrorState,
+				Data:    "Failed to save user: " + err.Error(),
+				Message: "An error occurred while saving the user",
+				Adv:     "none",
+			})
+			return
+		}
 	}
 
 	// insert login session to local db
