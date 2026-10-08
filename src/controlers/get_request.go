@@ -2112,6 +2112,29 @@ func buildVehicleInspectionTallyTimeline(vehicleId, manifestId string) (*constan
 }
 
 func buildInspectionDetailsFromTimeline(vehicleId string, archivedAt *time.Time, vehicleDets manifest.VehiclesDetailsAndTally, discharge []manifest.VehicleDischargeDetails) (VehicleInspectionDetailsRes, *constants.AnswerState) {
+	if archivedAt != nil {
+		// vehicleDets holds the active tally. A history batch shows its own archived
+		// tally (and its inspector), not the current one.
+		stt, tallies := manifestdataservices.SelectVehicleTimelineTally(vehicleId, archivedAt)
+		if stt.State != constants.SuccessState {
+			return VehicleInspectionDetailsRes{}, stt
+		}
+		if len(tallies) > 0 {
+			t := tallies[0]
+			vehicleDets.TallyId = t.TallyId
+			vehicleDets.UserId = t.UserId
+			vehicleDets.MakerId = t.MakerId
+			vehicleDets.BodyId = t.BodyId
+			vehicleDets.MakerName = t.MakerName
+			vehicleDets.BodyName = t.BodyName
+			vehicleDets.VehicleImage = t.VehicleImage
+			vehicleDets.DeckNumber = t.DeckNumber
+			vehicleDets.NumberOfKeys = t.NumberOfKeys
+			vehicleDets.KeyType = t.KeyType
+			vehicleDets.TalliedTime = t.TalliedTime
+		}
+	}
+
 	sti, inspections := manifestdataservices.SelectVehicleTimelineInspections(vehicleId, archivedAt)
 	if sti.State != constants.SuccessState {
 		return VehicleInspectionDetailsRes{}, sti

@@ -409,7 +409,7 @@ func SelectVehicleTimelineTally(vehicleId string, archivedAt *time.Time) (*const
 		vals = append(vals, *archivedAt)
 	}
 
-	qr := fmt.Sprintf("SELECT t.tally_id, t.vehicle_id, t.manifest_id, t.maker_id, t.body_id, t.tallied_time, vm.maker_name, vb.body_name, t.image_link, t.deck_number, t.number_of_keys, t.key_type FROM %s t INNER JOIN vehicle_makers vm ON vm.maker_id = t.maker_id INNER JOIN vehicle_bodies vb ON vb.body_id = t.body_id WHERE %s", table, where)
+	qr := fmt.Sprintf("SELECT t.tally_id, t.vehicle_id, t.manifest_id, t.maker_id, t.user_id, t.body_id, t.tallied_time, vm.maker_name, vb.body_name, t.image_link, t.deck_number, t.number_of_keys, t.key_type FROM %s t INNER JOIN vehicle_makers vm ON vm.maker_id = t.maker_id INNER JOIN vehicle_bodies vb ON vb.body_id = t.body_id WHERE %s", table, where)
 
 	st, rows := gendb.SelectGeneral(qr, vals)
 	if st.State != constants.SuccessState {
@@ -420,7 +420,7 @@ func SelectVehicleTimelineTally(vehicleId string, archivedAt *time.Time) (*const
 	result := []manifest.TallyMoreDetails{}
 	for rows.Next() {
 		var row manifest.TallyMoreDetails
-		if err := rows.Scan(&row.TallyId, &row.VehicleId, &row.ManifestId, &row.MakerId, &row.BodyId, &row.TalliedTime, &row.MakerName, &row.BodyName, &row.VehicleImage, &row.DeckNumber, &row.NumberOfKeys, &row.KeyType); err != nil {
+		if err := rows.Scan(&row.TallyId, &row.VehicleId, &row.ManifestId, &row.MakerId, &row.UserId, &row.BodyId, &row.TalliedTime, &row.MakerName, &row.BodyName, &row.VehicleImage, &row.DeckNumber, &row.NumberOfKeys, &row.KeyType); err != nil {
 			slog.Error(err.Error())
 			return &constants.AnswerState{State: constants.ErrorState, Data: "Failed to bind timeline tally data", Adv: "none"}, nil
 		}
